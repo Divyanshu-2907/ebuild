@@ -26,7 +26,12 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
-        os: [ubuntu-22.04, macos-13, windows-2022]
+        # macos-latest, not macos-13: the macos-13 image is retired, so jobs
+        # requesting it queue forever and never get a runner. Across four runs
+        # on this branch the ubuntu-22.04 and windows-2022 jobs all started and
+        # finished while the three macos-13 jobs sat queued for over two hours.
+        # Every other workflow in this repo already uses macos-latest.
+        os: [ubuntu-22.04, macos-latest, windows-2022]
       fail-fast: false
 
     steps:
