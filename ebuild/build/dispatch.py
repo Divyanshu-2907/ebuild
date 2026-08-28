@@ -215,7 +215,9 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            ValueError: If the backend is not recognized.
+            RuntimeError: If the backend is not recognized. configure() and
+                build() raise the same type for the same condition, so a
+                caller can guard all three with one ``except``.
         """
         if backend == "cmake":
             _run_or_log(
@@ -249,7 +251,7 @@ class BackendDispatcher:
                 check=False,
             )
         else:
-            raise ValueError(
+            raise RuntimeError(
                 f"Unknown build backend '{backend}'. "
                 f"Supported backends: {', '.join(sorted(ALL_BACKENDS))}"
             )
