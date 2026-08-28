@@ -96,3 +96,56 @@ def test_toolchain_mapping_is_parsed(tmp_path):
     assert config.toolchain.sysroot == "/opt/arm-none-eabi"
     assert config.toolchain.extra_cflags == ["-mcpu=cortex-m4"]
     assert config.toolchain.extra_ldflags == ["--specs=nosys.specs"]
+
+
+def test_system_section_does_not_select_system_backend(tmp_path):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "system-app"},
+            "targets": [
+                {"name": "app", "type": "executable", "sources": ["main.c"]}
+            ],
+            "system": {
+                "hostname": "eos-device",
+                "image_format": "ext4",
+            },
+        },
+    )
+
+    config = load_config(path)
+
+    assert config.backend == "auto"
+    assert config.backend_config == {}
+    assert config.system_config == {
+        "hostname": "eos-device",
+        "image_format": "ext4",
+    }
+
+
+def test_system_section_does_not_override_explicit_backend(tmp_path):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "cmake-system-app"},
+            "backend": "cmake",
+            "cmake": {"defines": {"BUILD_TESTS": "ON"}},
+            "system": {"hostname": "eos-device"},
+        },
+    )
+
+    config = load_config(path)
+
+    assert config.backend == "cmake"
+    assert config.backend_config == {"defines": {"BUILD_TESTS": "ON"}}
+    assert config.system_config == {"hostname": "eos-device"}
+
+
+def test_system_config_must_be_mapping(tmp_path):
+    path = write_config(
+        tmp_path,
+        {"project": {"name": "demo"}, "system": ["invalid"]},
+    )
+
+    with pytest.raises(ConfigError, match="'system' must be a mapping"):
+        load_config(path)

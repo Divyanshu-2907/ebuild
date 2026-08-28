@@ -94,6 +94,7 @@ class ProjectConfig:
     source_dir: Path = field(default_factory=lambda: Path("."))
     backend: str = "auto"
     backend_config: Dict[str, Any] = field(default_factory=dict)
+    system_config: Dict[str, Any] = field(default_factory=dict)
 
     def get_target(self, name: str) -> Optional[TargetConfig]:
         for t in self.targets:
@@ -221,13 +222,16 @@ def load_config(config_path: str | Path) -> ProjectConfig:
 
     if not isinstance(backend_config, dict):
         raise ConfigError("'backend_config' must be a mapping.")
+    backend_config = dict(backend_config)
 
-    # For system builds, pull from 'system' section
-    if raw.get("system") and isinstance(raw["system"], dict):
-        backend_config.update(raw["system"])
-
-        if backend == "auto":
-            backend = "system"
+    # System-image settings are not a compilation backend. Keep them separate
+    # so normal backend selection can still auto-detect CMake, Ninja, etc.
+    system_config = raw.get("system", {})
+    if system_config is None:
+        system_config = {}
+    if not isinstance(system_config, dict):
+        raise ConfigError("'system' must be a mapping.")
+    system_config = dict(system_config)
 
     # For cmake/make/meson builds, pull defines from config
     if raw.get("cmake") and isinstance(raw["cmake"], dict):
@@ -303,4 +307,5 @@ def load_config(config_path: str | Path) -> ProjectConfig:
         source_dir=config_path.parent,
         backend=backend,
         backend_config=backend_config,
+        system_config=system_config,
     )
