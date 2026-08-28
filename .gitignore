@@ -64,3 +64,4 @@ Desktop.ini
 build-*/
 node_modules/
 target/
+_build/
