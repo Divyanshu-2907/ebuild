@@ -9,6 +9,7 @@ Generates build.ninja and compile_commands.json from a ProjectConfig.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -103,6 +104,21 @@ class NinjaBackend:
                     cflags.append(f"-I{inc_dir}")
 
         return cflags
+
+    def _object_path(self, target, src: str) -> Path:
+        """Object file for one source within one target.
+
+        Namespaced by target name: a source shared by two targets must produce
+        two distinct objects. Ninja rejects two edges writing the same output,
+        and the targets may compile it with different cflags.
+
+        The source's directory structure is flattened into the filename rather
+        than mirrored beneath the build directory. Mirroring lets a source from
+        outside the project -- ``../shared/util.c`` -- place its object outside
+        the build directory too, where ``clean`` will not find it.
+        """
+        flat = re.sub(r"[^A-Za-z0-9_.-]", "_", str(src).replace("\\", "/"))
+        return self.build_dir / "obj" / target.name / f"{flat}.o"
 
     def _write_ninja(self) -> None:
         """Write the build.ninja file."""

@@ -62,8 +62,15 @@ class TestNinjaBackendSharedLibrary(unittest.TestCase):
         ninja = self._generate("static", target)
 
         self.assertIn(": ar_rule", ninja)
-        self.assertNotIn("-shared", ninja)
-        self.assertNotIn("-dynamiclib", ninja)
+
+        # The link_shared *rule* is always declared in the preamble, so the
+        # bare string "-shared" is present in every generated file. What must
+        # be absent is any build *edge* that uses it.
+        edges = [line for line in ninja.splitlines() if line.startswith("build ")]
+        self.assertTrue(edges, "no build edges were generated")
+        for edge in edges:
+            self.assertNotIn(": link_shared ", edge)
+            self.assertNotIn(": link ", edge)
 
 
 if __name__ == "__main__":
