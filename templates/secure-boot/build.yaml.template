@@ -16,4 +16,6 @@ targets:
       - src/main.c
     includes:
       - src/
+    uses:
+      - eos
     depends: []

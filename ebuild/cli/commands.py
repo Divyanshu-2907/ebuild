@@ -187,6 +187,40 @@ def _install_packages(
     return package_paths
 
 
+def _workspace_repo_paths() -> Dict[str, PackagePaths]:
+    """Include paths for the eos and eboot repos that `ebuild setup` cloned.
+
+    A scaffolded project includes <eos/hal.h>, but the generated build.yaml
+    carried no path to the headers, so every template failed with
+    "fatal error: eos/hal.h: No such file or directory" on the first build.
+
+    These are resolved at build time from the cache rather than written into
+    build.yaml as absolute paths: the path is a fact about this machine, and
+    build.yaml is a file the developer commits.
+
+    Returns an empty mapping when the cache is absent, so the error a developer
+    sees stays the missing header rather than a stack trace, and `ebuild setup`
+    remains the fix.
+    """
+    from ebuild.deps import EBUILD_REPOS_DIR
+
+    paths: Dict[str, PackagePaths] = {}
+    for name in ("eos", "eboot"):
+        root = Path(EBUILD_REPOS_DIR) / name
+        if not root.is_dir():
+            continue
+        # Headers sit at two depths: kernel/include, hal/include ... and
+        # services/crypto/include, services/ota/include. Both are needed --
+        # <eos/crypto.h> and <eos/ota.h> live only in the deeper set.
+        include_dirs = sorted(
+            {p for pattern in ("include", "*/include", "*/*/include")
+             for p in root.glob(pattern) if p.is_dir()}
+        )
+        if include_dirs:
+            paths[name] = PackagePaths(include_dirs=include_dirs, lib_dirs=[], libraries=[])
+    return paths
+
+
 def _detect_libraries(lib_dir: Path, pkg_name: str) -> List[str]:
     """Detect installed library names from a lib/ directory."""
     if not lib_dir.exists():
@@ -678,7 +712,8 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         log.debug(f"Compiler: {compiler.cc}")
 
         # Install packages if any are declared
-        package_paths = _install_packages(cfg, build_path, log, verbose=log.verbose, jobs=jobs)
+        package_paths = {**_workspace_repo_paths(),
+                         **_install_packages(cfg, build_path, log, verbose=log.verbose, jobs=jobs)}
 
         log.step(f"Generating build.ninja in {build_path}/...")
         ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
