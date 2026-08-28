@@ -22,11 +22,25 @@ shell ever getting a chance to reinterpret it.
 """
 
 import gzip
+import shutil
 import subprocess
+
+import pytest
 
 from ebuild.cli.integration import _create_initramfs
 
+# _create_initramfs() drives find(1) and cpio(1) directly. Neither exists on a
+# stock Windows runner, so these fail with WinError 2 before reaching anything
+# they mean to test. Building a Linux initramfs is not a Windows operation;
+# skipping is the honest outcome, matching how test_ninja_backend.py skips when
+# no host C compiler is present.
+requires_cpio = pytest.mark.skipif(
+    shutil.which("cpio") is None or shutil.which("find") is None,
+    reason="find(1)/cpio(1) not available on this host",
+)
 
+
+@requires_cpio
 def test_create_initramfs_produces_valid_gzip_with_expected_content(tmp_path):
     """Functional regression: the pipeline must still work correctly."""
     rootfs = tmp_path / "rootfs"
@@ -56,6 +70,7 @@ def test_create_initramfs_produces_valid_gzip_with_expected_content(tmp_path):
     assert b"hello.txt" in result.stdout
 
 
+@requires_cpio
 def test_create_initramfs_build_dir_with_shell_metacharacters_is_not_interpreted(tmp_path):
     """A build_dir name containing shell syntax must be treated as a plain
     literal path component, never parsed as shell syntax. Pre-fix, a name
@@ -84,6 +99,7 @@ def test_create_initramfs_build_dir_with_shell_metacharacters_is_not_interpreted
     assert not (rootfs / "pwned_marker").exists()
 
 
+@requires_cpio
 def test_create_initramfs_rootfs_with_shell_metacharacters_is_not_interpreted(tmp_path):
     """Same check for the ``rootfs`` argument (the ``cd {rootfs}`` half of
     the old shell string)."""

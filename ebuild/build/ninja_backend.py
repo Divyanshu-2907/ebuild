@@ -30,6 +30,25 @@ _PIC_FLAGS = {"-fPIC", "-fpic", "-fPIE", "-fpie", "-fno-pic", "-fno-PIC",
               "-fno-pie", "-fno-PIE"}
 
 
+def _ninja_path(path) -> str:
+    """Escape *path* for use in a Ninja build statement.
+
+    Ninja splits build statements on unescaped spaces and colons, so a Windows
+    absolute path writes a drive letter that Ninja reads as the output/rule
+    separator:
+
+        build C:\\...\\main.o: cc main.c
+              ^ "expected build command name"
+
+    `$` is escaped first so the escapes introduced below are not re-escaped.
+    Only build statements need this; variable values (cflags, ldflags) are read
+    to end of line and must not be escaped, or the flags reach the compiler
+    mangled.
+    """
+    text = str(path)
+    return text.replace("$", "$$").replace(":", "$:").replace(" ", "$ ")
+
+
 class NinjaBackend:
     """Generate build.ninja from a ProjectConfig and resolved toolchain.
 
@@ -155,7 +174,7 @@ class NinjaBackend:
                 obj = str(self._object_path(target, src))
                 obj_files.append(obj)
                 lines.append(
-                    f"build {obj}: cc {src}"
+                    f"build {_ninja_path(obj)}: cc {_ninja_path(src)}"
                 )
                 if cflags:
                     lines.append(f"  cflags = {' '.join(cflags)}")
@@ -182,7 +201,8 @@ class NinjaBackend:
                 link_inputs = obj_files + dep_archives
                 out = str(self.build_dir / target.name)
                 lines.append(
-                    f"build {out}: link {' '.join(link_inputs)}"
+                    f"build {_ninja_path(out)}: link "
+                    f"{' '.join(_ninja_path(i) for i in link_inputs)}"
                 )
                 if ldflags:
                     lines.append(f"  ldflags = {' '.join(ldflags)}")
@@ -200,7 +220,10 @@ class NinjaBackend:
                 out = str(self.build_dir / f"lib{target.name}{ext}")
 
                 if target.target_type == "static_library":
-                    lines.append(f"build {out}: ar_rule {' '.join(obj_files)}")
+                    lines.append(
+                        f"build {_ninja_path(out)}: ar_rule "
+                        f"{' '.join(_ninja_path(o) for o in obj_files)}"
+                    )
                 else:
                     # Shared libraries need the platform's "build a shared
                     # object" flag and the same -L/-l wiring executables get,
@@ -216,7 +239,10 @@ class NinjaBackend:
                             for lib in pkg.libraries:
                                 libs.append(f"-l{lib}")
 
-                    lines.append(f"build {out}: link {' '.join(obj_files)}")
+                    lines.append(
+                        f"build {_ninja_path(out)}: link "
+                        f"{' '.join(_ninja_path(o) for o in obj_files)}"
+                    )
                     if ldflags:
                         lines.append(f"  ldflags = {' '.join(ldflags)}")
                     if libs:
