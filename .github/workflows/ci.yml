@@ -42,8 +42,12 @@ jobs:
         run: ruff check . --select=E,F,W --ignore=E501
         continue-on-error: true
 
+      # --exclude: layers/eosuite/ vendors its own tests/ package, so a bare
+      # `mypy .` sees two modules named "tests" and bails with "Duplicate
+      # module named 'tests'" before checking anything. continue-on-error hid
+      # that the type check was doing no work at all.
       - name: Type check (mypy)
-        run: mypy . --ignore-missing-imports --no-strict-optional
+        run: mypy . --ignore-missing-imports --no-strict-optional --exclude '^layers/'
         continue-on-error: true
 
       # Runs the whole tests/ tree. The previous steps ran only tests/unit/
@@ -57,7 +61,13 @@ jobs:
       # coverage policy already lives in codecov.yml; whether to also
       # enforce it here is a maintainer decision, so this change leaves
       # both of those numbers alone.
+      #
+      # shell: bash — the matrix includes windows-2022, where the default
+      # shell is PowerShell and the backslash line continuations below are a
+      # syntax error ("Missing expression after unary operator '--'"), so the
+      # Windows leg of this job failed before pytest ever started.
       - name: Run test suite
+        shell: bash
         run: |
           python -m pytest tests/ -v --tb=short \
             --cov=ebuild --cov-report=xml --cov-report=term-missing \
