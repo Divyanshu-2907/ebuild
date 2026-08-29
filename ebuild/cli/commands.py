@@ -244,6 +244,49 @@ def _selected_board(default: str = "generic") -> str:
     return (data.get("system") or {}).get("board") or default
 
 
+def _build_summary(cfg: "ProjectConfig", compiler, package_paths, log: Logger) -> None:
+    """The per-component summary the MLP walk ends with.
+
+    A build that prints only "Build completed successfully" leaves the
+    developer to infer what was actually in it. The interesting case is a
+    package that resolved to nothing: the build still succeeds, the feature is
+    simply absent, and nothing said so.
+    """
+    board = _selected_board(default="")
+    rows = [
+        ("toolchain", getattr(compiler, "cc", "") or "cc", True),
+        ("board configuration", board or "host (no board recorded)", True),
+    ]
+
+    declared = [p.name for p in getattr(cfg, "packages", []) or []]
+    for name in declared:
+        paths = (package_paths or {}).get(name)
+        # A package with no resolved include or library directory contributed
+        # nothing to this build, whatever build.yaml says.
+        resolved = bool(paths and (paths.include_dirs or paths.lib_dirs))
+        rows.append((name, "" if resolved else "declared, nothing resolved",
+                     resolved))
+
+    for target in cfg.targets:
+        if target.target_type in ("executable", "test"):
+            rows.append((target.name, target.target_type, True))
+
+    width = max(len(n) for n, _d, _ok in rows)
+    log.info("")
+    log.info("EmbeddedOS Build")
+    for name, detail, ok in rows:
+        mark = "OK  " if ok else "MISS"
+        log.info(f"  {mark} {name.ljust(width)}" + (f"  {detail}" if detail else ""))
+
+    missing = [n for n, _d, ok in rows if not ok]
+    if missing:
+        log.warning(
+            f"{len(missing)} declared package(s) resolved to nothing: "
+            + ", ".join(missing)
+            + ". The build succeeded without them."
+        )
+
+
 def _report_footprint(cfg: "ProjectConfig", build_path: Path, log: Logger) -> None:
     """Print how much of the board the build just used.
 
@@ -796,6 +839,7 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
             raise SystemExit(1)
 
         log.success("Build completed successfully.")
+        _build_summary(cfg, compiler, package_paths, log)
         _report_footprint(cfg, build_path, log)
 
     except FileNotFoundError as e:
@@ -1101,6 +1145,33 @@ def install(log: Logger, config_path: str, build_dir: str) -> None:
         raise SystemExit(1)
 
 
+def _no_recipe_message(name: str, registry) -> str:
+    """Say what is available, and what the developer probably meant.
+
+    "No recipe found" on its own leaves them guessing at the spelling, at
+    whether the package exists under another name, and at where recipes even
+    come from.
+    """
+    import difflib
+
+    try:
+        available = sorted({r.name for r in registry.list_packages()})
+    except Exception:
+        available = []
+
+    lines = [f"No recipe for '{name}'."]
+    close = difflib.get_close_matches(name, available, n=3, cutoff=0.6)
+    if close:
+        lines.append("  Did you mean: " + ", ".join(close) + "?")
+    if available:
+        lines.append("  Available: " + ", ".join(available))
+    else:
+        lines.append("  No recipes are visible from here — is this a project "
+                     "directory with a recipes/ folder?")
+    lines.append(f"  To add it anyway: ebuild add {name} --force")
+    return "\n".join(lines)
+
+
 @cli.command("add")
 @click.argument("package_name")
 @click.option("--version", "pkg_version", default=None, help="Package version to add.")
@@ -1110,8 +1181,13 @@ def install(log: Logger, config_path: str, build_dir: str) -> None:
     type=click.Path(exists=False),
     help="Path to the build configuration file.",
 )
+@click.option(
+    "--force", is_flag=True, default=False,
+    help="Add a package with no recipe. It will not resolve until one exists.",
+)
 @click.pass_obj
-def add_package(log: Logger, package_name: str, pkg_version: Optional[str], config_path: str) -> None:
+def add_package(log: Logger, package_name: str, pkg_version: Optional[str],
+                config_path: str, force: bool) -> None:
     """Add a package dependency to build.yaml."""
     log.header("ebuild — Add Package")
 
@@ -1129,8 +1205,17 @@ def add_package(log: Logger, package_name: str, pkg_version: Optional[str], conf
             log.info(f"Found recipe: {recipe.name} v{recipe.version}")
             if pkg_version is None:
                 pkg_version = recipe.version
+        elif not force:
+            # Writing an entry that cannot resolve trades one clear error now
+            # for a confusing one at build time, in a file the developer has
+            # since committed.
+            log.error(_no_recipe_message(package_name, registry))
+            raise SystemExit(1)
         else:
-            log.warning(f"No recipe found for '{package_name}' — adding anyway.")
+            log.warning(
+                f"No recipe found for '{package_name}' — added because "
+                f"--force was given. It will not resolve until a recipe exists."
+            )
 
     # Load and update config
     with open(config_path_obj, "r", encoding="utf-8") as f:
