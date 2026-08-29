@@ -2066,3 +2066,35 @@ def generate_board(
     except Exception as e:
         log.error(f"Board generation failed: {e}")
         raise SystemExit(1)
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit the checks as JSON, for CI.")
+@click.pass_obj
+def doctor(log: Logger, as_json: bool) -> None:
+    """Diagnose the build environment in one command.
+
+    Reports what is installed, what is missing, and what each missing piece
+    would cost. Read-only: it names the fix rather than applying it.
+
+    Exits non-zero only for problems that actually stop a build, so a
+    host-only machine with no cross toolchain still passes.
+    """
+    from ebuild.system.doctor import exit_code, format_report, run_all
+
+    checks = run_all()
+
+    if as_json:
+        import json as _json
+        click.echo(_json.dumps(
+            [{"name": c.name, "status": c.status,
+              "detail": c.detail, "fix": c.fix} for c in checks],
+            indent=2,
+        ))
+        raise SystemExit(exit_code(checks))
+
+    log.header("ebuild — Environment")
+    for line in format_report(checks).splitlines():
+        click.echo(line)
+    raise SystemExit(exit_code(checks))
