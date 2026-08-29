@@ -226,6 +226,94 @@ def _resolve_backend_request(
     return resolved_backend, backend_config
 
 
+def _selected_board(default: str = "generic") -> str:
+    """The board this project targets, from its eos.yaml.
+
+    Read rather than passed in: `ebuild build` takes no --board of its own in
+    the documented walk, so the value has to survive from `ebuild new` or
+    `ebuild configure`.
+    """
+    path = Path("eos.yaml")
+    if not path.is_file():
+        return default
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return default
+    return (data.get("system") or {}).get("board") or default
+
+
+def _report_footprint(cfg: "ProjectConfig", build_path: Path, log: Logger) -> None:
+    """Print how much of the board the build just used.
+
+    The MLP walk ends with a build that says `Flash: 384 KB / RAM: 72 KB`. A
+    developer who has to run `size` themselves and remember which columns to
+    add is not being told; they are being left to find out.
+
+    Never fatal. A footprint that cannot be measured -- no binutils, a cross
+    toolchain whose `size` is not installed -- is a missing convenience, and
+    failing a successful build over it would be worse than the silence it
+    replaces.
+    """
+    from ebuild.build.footprint import (
+        FootprintError, board_capacity, find_size_tool, format_report,
+        measure, over_budget,
+    )
+
+    binaries = [t for t in cfg.targets if t.target_type == "executable"]
+    if not binaries:
+        return
+
+    artifact = build_path / binaries[0].name
+    if not artifact.is_file():
+        return
+
+    prefix = getattr(cfg.toolchain, "target", None) or "host"
+    tool = find_size_tool(prefix)
+    if tool is None:
+        log.debug(f"no size tool for toolchain {prefix!r}; skipping footprint")
+        return
+
+    try:
+        fp = measure(artifact, tool)
+    except FootprintError as exc:
+        log.debug(f"footprint unavailable: {exc}")
+        return
+
+    board = _selected_board(default="")
+    flash_cap, ram_cap = board_capacity(board or None, _board_config())
+    log.info("")
+    for line in format_report(fp, flash_cap, ram_cap).splitlines():
+        log.info(line)
+
+    exceeded = over_budget(fp, flash_cap, ram_cap)
+    if exceeded:
+        # Not a build failure: the image linked. It will not fit on the board,
+        # which the developer needs to hear now rather than from a device that
+        # will not boot.
+        log.warning(f"{exceeded} -- this image will not fit.")
+    else:
+        log.info("Ready to flash.")
+
+
+def _board_config() -> Optional[Dict[str, Any]]:
+    """The project's own board description, if it ships one.
+
+    A project that states its part's real capacity should not be measured
+    against the reference part for its family.
+    """
+    path = Path("board.yaml")
+    if not path.is_file():
+        return None
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _configure_ninja_backend(
     cfg: ProjectConfig,
     build_path: Path,
@@ -708,6 +796,7 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
             raise SystemExit(1)
 
         log.success("Build completed successfully.")
+        _report_footprint(cfg, build_path, log)
 
     except FileNotFoundError as e:
         log.error(_format_missing_tool(e))
