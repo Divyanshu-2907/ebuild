@@ -9,7 +9,9 @@ pipeline, and hardware analysis commands.
 
 from __future__ import annotations
 
+import glob
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -187,6 +189,95 @@ def _install_packages(
     return package_paths
 
 
+def _workspace_repo_paths() -> Dict[str, PackagePaths]:
+    """Include paths for the eos and eboot repos that `ebuild setup` cloned.
+
+    A scaffolded project includes <eos/hal.h>, but the generated build.yaml
+    carried no path to the headers, so every template failed with
+    "fatal error: eos/hal.h: No such file or directory" on the first build.
+
+    These are resolved at build time from the cache rather than written into
+    build.yaml as absolute paths: the path is a fact about this machine, and
+    build.yaml is a file the developer commits.
+
+    Returns an empty mapping when the cache is absent, so the error a developer
+    sees stays the missing header rather than a stack trace, and `ebuild setup`
+    remains the fix.
+    """
+    from ebuild.deps import EBUILD_REPOS_DIR
+
+    paths: Dict[str, PackagePaths] = {}
+    for name in ("eos", "eboot"):
+        root = Path(EBUILD_REPOS_DIR) / name
+        if not root.is_dir():
+            continue
+        # Headers sit at two depths: kernel/include, hal/include ... and
+        # services/crypto/include, services/ota/include. Both are needed --
+        # <eos/crypto.h> and <eos/ota.h> live only in the deeper set.
+        include_dirs = sorted(
+            {p for pattern in ("include", "*/include", "*/*/include")
+             for p in root.glob(pattern) if p.is_dir()}
+        )
+        if include_dirs:
+            lib_dirs, libraries = _cached_repo_libraries(root)
+            paths[name] = PackagePaths(
+                include_dirs=include_dirs,
+                lib_dirs=lib_dirs,
+                libraries=libraries,
+            )
+    return paths
+
+
+# Where `ebuild` puts the CMake build tree for a cached repo. Kept inside the
+# clone so `ebuild setup` remains the only thing that owns ~/.ebuild/repos.
+_REPO_BUILD_DIRNAME = "_ebuild"
+
+
+def _cached_repo_libraries(root: Path) -> Tuple[List[Path], List[str]]:
+    """Static libraries a cached repo offers to projects that `use` it.
+
+    Headers alone are not enough: a scaffolded project compiles against
+    <eos/hal.h> and then fails at the link step with undefined references.
+    The repo is a CMake project with no install() rules, so there is nothing
+    to point a -L at until it has been built once. Build it on demand and
+    cache the result; subsequent builds reuse the tree.
+
+    Returns ([], []) when the repo cannot be built here — a missing cmake, a
+    repo that is not a CMake project — so the developer still gets a link
+    error naming the symbol rather than a stack trace from ebuild.
+    """
+    if not (root / "CMakeLists.txt").is_file():
+        return [], []
+
+    build_dir = root / _REPO_BUILD_DIRNAME
+    archives = sorted(build_dir.rglob("*.a")) if build_dir.is_dir() else []
+
+    if not archives:
+        if shutil.which("cmake") is None:
+            return [], []
+        try:
+            subprocess.run(
+                ["cmake", "-S", str(root), "-B", str(build_dir)],
+                check=True, capture_output=True, timeout=600,
+            )
+            subprocess.run(
+                ["cmake", "--build", str(build_dir), "-j", str(os.cpu_count() or 1)],
+                check=True, capture_output=True, timeout=1800,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return [], []
+        archives = sorted(build_dir.rglob("*.a"))
+
+    if not archives:
+        return [], []
+
+    # -L one directory per archive location; -l the archive basenames with
+    # the lib prefix and .a suffix stripped, which is what the linker wants.
+    lib_dirs = sorted({a.parent for a in archives})
+    libraries = [a.stem[3:] for a in archives if a.stem.startswith("lib")]
+    return lib_dirs, libraries
+
+
 def _detect_libraries(lib_dir: Path, pkg_name: str) -> List[str]:
     """Detect installed library names from a lib/ directory."""
     if not lib_dir.exists():
@@ -318,12 +409,22 @@ def _configure_ninja_backend(
     cfg: ProjectConfig,
     build_path: Path,
     log: Logger,
+    *,
+    suggest_build: bool = True,
 ) -> None:
-    """Generate native ebuild Ninja files for configure-only workflows."""
+    """Generate native ebuild Ninja files for configure-only workflows.
+
+    The package paths are merged exactly as `ebuild build` merges them. If
+    they were not, `configure` and `build` would each write a different
+    build.ninja to the same path, and a developer who ran `configure` and then
+    invoked ninja directly would build without the cached-repo include and
+    library paths.
+    """
     log.step("Resolving toolchain...")
     compiler = resolve_toolchain(cfg.toolchain)
 
-    package_paths = _install_packages(cfg, build_path, log, verbose=log.verbose)
+    package_paths = {**_workspace_repo_paths(),
+                     **_install_packages(cfg, build_path, log, verbose=log.verbose)}
 
     log.step(f"Generating build.ninja in {build_path}/...")
     ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
@@ -331,7 +432,8 @@ def _configure_ninja_backend(
 
     log.success(f"Generated {build_path / 'build.ninja'}")
     log.success(f"Generated {build_path / 'compile_commands.json'}")
-    log.info("Run 'ebuild build' to compile.")
+    if suggest_build:
+        log.info("Run 'ebuild build' to compile.")
 
 
 def _configure_external_backend(
@@ -379,6 +481,63 @@ def _format_missing_tool(exc: FileNotFoundError) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Board selection — shared by `configure --board` and `monitor`
+# ---------------------------------------------------------------------------
+
+# The project-local file that records which board this checkout targets.
+_EOS_PROJECT_CONFIG = "eos.yaml"
+
+
+def _record_board_selection(board: str, log: Logger) -> None:
+    """Persist ``--board`` into eos.yaml under ``system.board``.
+
+    The golden path is `configure --board` then a bare `build`, so the choice
+    has to outlive the configure process. It is written to eos.yaml rather
+    than build.yaml because the board is a property of the system being
+    targeted, which is what eos.yaml already describes.
+    """
+    path = Path(_EOS_PROJECT_CONFIG)
+    if not path.is_file():
+        log.error(
+            f"No {_EOS_PROJECT_CONFIG} here, so there is nothing to record the "
+            f"board against. Run this from a project directory created by "
+            f"'ebuild new'."
+        )
+        raise SystemExit(1)
+
+    import yaml
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as e:
+        log.error(f"{_EOS_PROJECT_CONFIG} is not valid YAML: {e}")
+        raise SystemExit(1)
+
+    system = data.setdefault("system", {})
+    previous = system.get("board")
+    system["board"] = board
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    if previous and previous != board:
+        log.info(f"Board: {previous} -> {board}")
+    else:
+        log.info(f"Board: {board}")
+
+
+def _selected_board(default: str = "generic") -> str:
+    """The board recorded by ``configure --board``, or ``default``."""
+    path = Path(_EOS_PROJECT_CONFIG)
+    if not path.is_file():
+        return default
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return default
+    return (data.get("system") or {}).get("board") or default
+
+
+# ---------------------------------------------------------------------------
 #  Pipeline helper — shared by `pipeline` and `build --board`
 # ═══════════════════════════════════════════════════════════════
 
@@ -766,7 +925,8 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         log.debug(f"Compiler: {compiler.cc}")
 
         # Install packages if any are declared
-        package_paths = _install_packages(cfg, build_path, log, verbose=log.verbose, jobs=jobs)
+        package_paths = {**_workspace_repo_paths(),
+                         **_install_packages(cfg, build_path, log, verbose=log.verbose, jobs=jobs)}
 
         log.step(f"Generating build.ninja in {build_path}/...")
         ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
@@ -775,7 +935,8 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         log.success(f"Generated {build_path / 'compile_commands.json'}")
 
         log.step("Invoking ninja...")
-        ninja_cmd = [sys.executable, "-m", "ninja", "-f", str(build_path / "build.ninja")]
+        from ebuild.build.dispatch import ninja_command
+        ninja_cmd = ninja_command() + ["-f", str(build_path / "build.ninja")]
         if log.verbose:
             ninja_cmd.append("-v")
 
@@ -954,12 +1115,22 @@ def clean(log: Logger, build_dir: str) -> None:
     type=click.Choice(["auto", "cmake", "make", "meson", "cargo", "ninja", "kbuild"]),
     help="Force a specific build backend.",
 )
+@click.option(
+    "--board",
+    default=None,
+    help="Target board name (e.g., stm32f4, nrf52). Recorded in the project "
+         "config so later `ebuild build` / `flash` / `monitor` use it.",
+)
 @click.pass_obj
-def configure(log: Logger, config_path: str, build_dir: str, backend: Optional[str]) -> None:
+def configure(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
+              board: Optional[str]) -> None:
     """Generate build files without building."""
     log.header("ebuild — Configure")
 
     try:
+        if board:
+            _record_board_selection(board, log)
+
         log.step("Loading configuration...")
         cfg = load_config(config_path)
         log.info(f"Project: {cfg.name} v{cfg.version}")
@@ -1719,6 +1890,11 @@ def new(log: Logger, project_name: str, template_name: str, board_name: str,
     # Create project directory structure
     src_dir = project_dir / "src"
     src_dir.mkdir(parents=True)
+    # A scaffolded project ships a runnable test so that `ebuild test`, step
+    # six of the golden path, passes on a fresh checkout instead of reporting
+    # that the project declares no tests.
+    tests_dir = project_dir / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
 
     # Template variable substitution
     replacements = {
@@ -1734,6 +1910,7 @@ def new(log: Logger, project_name: str, template_name: str, board_name: str,
     # Copy and process template files
     file_mapping = {
         "main.c.template": src_dir / "main.c",
+        "test_main.c.template": tests_dir / "test_main.c",
         "build.yaml.template": project_dir / "build.yaml",
         "eos.yaml.template": project_dir / "eos.yaml",
         "README.md.template": project_dir / "README.md",

@@ -26,6 +26,23 @@ TIER_3 = {"cargo"}
 ALL_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild", "ninja"}
 
 
+def ninja_command():
+    """Return the argv prefix that runs ninja on this machine.
+
+    Prefer a `ninja` executable on PATH -- that is what a developer who
+    followed any ordinary install guide has, and what CMake and Meson already
+    use. Fall back to the `ninja` PyPI wheel only when no binary is present.
+
+    ebuild used to invoke `sys.executable -m ninja` unconditionally, so a
+    machine with ninja correctly installed still failed with "No module named
+    ninja" on the first build of a new project.
+    """
+    import shutil
+
+    exe = shutil.which("ninja")
+    return [exe] if exe else [sys.executable, "-m", "ninja"]
+
+
 def detect_backend(source_dir: Path) -> str:
     """Auto-detect the build system from project files.
 
@@ -121,22 +138,15 @@ class BackendDispatcher:
         elif backend == "cargo":
             pass  # Cargo does not have a separate configure step
 
-        elif backend in ("make", "kbuild", "ninja"):
+        elif backend in ("make", "kbuild"):
             pass  # No separate configure step
-
-        else:
-            raise ValueError(
-                f"Unknown build backend '{backend}'. "
-                f"Supported backends: {', '.join(sorted(ALL_BACKENDS))}"
-            )
 
         else:
             raise RuntimeError(
                 f"BackendDispatcher cannot configure backend '{backend}'. "
                 "This dispatcher only handles cmake, meson, and cargo "
                 "(make/kbuild need no configure step). ebuild's own ninja "
-                "backend is invoked directly and requires 'targets' in "
-                "build.yaml -- add targets or choose another backend."
+                "backend is generated and invoked by the CLI, not here."
             )
 
     def build(
@@ -185,9 +195,11 @@ class BackendDispatcher:
             _run_or_log(cmd, dry_run)
 
         else:
-            raise ValueError(
-                f"Unknown build backend '{backend}'. "
-                f"Supported backends: {', '.join(sorted(ALL_BACKENDS))}"
+            raise RuntimeError(
+                f"BackendDispatcher cannot build backend '{backend}'. "
+                "Supported here: cargo, cmake, kbuild, make, meson. ebuild's own "
+                "ninja backend is generated and invoked by the CLI, not through "
+                "this dispatcher."
             )
 
     def clean(
@@ -203,7 +215,9 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            ValueError: If the backend is not recognized.
+            RuntimeError: If the backend is not recognized. configure() and
+                build() raise the same type for the same condition, so a
+                caller can guard all three with one ``except``.
         """
         if backend == "cmake":
             _run_or_log(
@@ -232,12 +246,12 @@ class BackendDispatcher:
             )
         elif backend == "ninja":
             _run_or_log(
-                [sys.executable, "-m", "ninja", "-C", str(self.build_dir), "-t", "clean"],
+                ninja_command() + ["-C", str(self.build_dir), "-t", "clean"],
                 dry_run,
                 check=False,
             )
         else:
-            raise ValueError(
+            raise RuntimeError(
                 f"Unknown build backend '{backend}'. "
                 f"Supported backends: {', '.join(sorted(ALL_BACKENDS))}"
             )
