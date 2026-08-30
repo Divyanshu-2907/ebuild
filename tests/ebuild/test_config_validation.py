@@ -96,3 +96,30 @@ def test_toolchain_mapping_is_parsed(tmp_path):
     assert config.toolchain.sysroot == "/opt/arm-none-eabi"
     assert config.toolchain.extra_cflags == ["-mcpu=cortex-m4"]
     assert config.toolchain.extra_ldflags == ["--specs=nosys.specs"]
+
+
+@pytest.mark.parametrize("field_name", ["extra_cflags", "extra_ldflags"])
+def test_toolchain_flag_fields_must_be_lists(tmp_path, field_name):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "demo"},
+            "toolchain": {field_name: "-O2"},
+        },
+    )
+
+    with pytest.raises(ConfigError, match=rf"field '{field_name}' must be a list"):
+        load_config(path)
+
+
+def test_toolchain_flag_items_must_be_strings(tmp_path):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "demo"},
+            "toolchain": {"extra_cflags": ["-O2", 42]},
+        },
+    )
+
+    with pytest.raises(ConfigError, match="extra_cflags.*must contain only strings"):
+        load_config(path)
