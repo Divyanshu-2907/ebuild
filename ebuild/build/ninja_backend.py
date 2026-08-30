@@ -30,6 +30,25 @@ _PIC_FLAGS = {"-fPIC", "-fpic", "-fPIE", "-fpie", "-fno-pic", "-fno-PIC",
               "-fno-pie", "-fno-PIE"}
 
 
+def escape_ninja_path(path) -> str:
+    """Escape a path for use inside a Ninja build statement.
+
+    Ninja's lexer ends the output list at the first unescaped ``:`` and splits
+    on unescaped spaces, so a Windows drive letter or a directory containing a
+    space does not raise an error -- it silently parses into several wrong
+    targets. ``C:\\Users\\Jane Doe\\build\\app.o`` becomes four targets
+    (``C``, ``...\\Jane``, ``Doe``, ``build\\app.o``) instead of one.
+
+    ``$`` is replaced first: the space and colon replacements introduce ``$``
+    characters that must not be escaped again.
+
+    Only the manifest needs this. Ninja shell-quotes ``$in``/``$out`` itself
+    when it builds the command line, so an escaped path still reaches the
+    compiler as a single argument.
+    """
+    return str(path).replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
+
+
 class NinjaBackend:
     """Generate build.ninja from a ProjectConfig and resolved toolchain.
 
@@ -156,10 +175,10 @@ class NinjaBackend:
 
             obj_files = []
             for src in target.sources:
-                obj = str(self._object_path(target, src))
+                obj = escape_ninja_path(self._object_path(target, src))
                 obj_files.append(obj)
                 lines.append(
-                    f"build {obj}: cc {src}"
+                    f"build {obj}: cc {escape_ninja_path(src)}"
                 )
                 if cflags:
                     lines.append(f"  cflags = {' '.join(cflags)}")
@@ -181,10 +200,12 @@ class NinjaBackend:
                 for dep_name in target.depends:
                     for dep_target in self.config.targets:
                         if dep_target.name == dep_name and dep_target.target_type == "static_library":
-                            dep_archives.append(str(self.build_dir / f"lib{dep_name}.a"))
+                            dep_archives.append(
+                                escape_ninja_path(self.build_dir / f"lib{dep_name}.a")
+                            )
 
                 link_inputs = obj_files + dep_archives
-                out = str(self.build_dir / target.name)
+                out = escape_ninja_path(self.build_dir / target.name)
                 lines.append(
                     f"build {out}: link {' '.join(link_inputs)}"
                 )
@@ -201,7 +222,7 @@ class NinjaBackend:
                     ext = ".dylib"
                 else:
                     ext = ".so"
-                out = str(self.build_dir / f"lib{target.name}{ext}")
+                out = escape_ninja_path(self.build_dir / f"lib{target.name}{ext}")
 
                 if target.target_type == "static_library":
                     lines.append(f"build {out}: ar_rule {' '.join(obj_files)}")

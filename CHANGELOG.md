@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Fixed
+- **A path containing a space produced a silently wrong `build.ninja`.** Paths
+  were written into build statements unescaped, but Ninja ends the output list
+  at the first unescaped `:` and splits on unescaped spaces. A build directory
+  under `C:\Users\Jane Doe\` parsed into four targets instead of one, so
+  `ebuild build` failed with `expected build command name` or built the wrong
+  thing. `$`, spaces and `:` are now escaped in generated build statements
+  (`ebuild/build/ninja_backend.py`).
 - **`NinjaBackend` could not generate anything.** `_object_path()` is called by
   both `_write_ninja()` and `_write_compile_commands()`, but the method itself
   was dropped in a merge, so every `generate()` raised
