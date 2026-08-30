@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Fixed
+- **`NinjaBackend` could not generate anything.** `_object_path()` is called by
+  both `_write_ninja()` and `_write_compile_commands()`, but the method itself
+  was dropped in a merge, so every `generate()` raised
+  `AttributeError: 'NinjaBackend' object has no attribute '_object_path'`.
+  The method and its regression tests are restored: objects are named
+  `obj/<target>/<source>.o`, so a source listed by two targets compiles once
+  per target instead of both targets claiming one output — which ninja rejects
+  with `multiple rules generate ...` (`ebuild/build/ninja_backend.py`).
 - **`ebuild.build.dispatch` was unimportable.** Two branches independently added
   an unhandled-backend `else` clause to `BackendDispatcher.configure()`; the
   merge kept both, leaving a second `else` after the first and a `SyntaxError`
