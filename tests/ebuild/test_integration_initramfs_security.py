@@ -1,13 +1,12 @@
-"""Regression tests for the command-injection fix in _create_initramfs().
+"""Regression tests for portable, injection-safe initramfs creation.
 
 _create_initramfs() used to build a single shell string
 (``cd {rootfs} && find . | cpio ... > {initramfs}``) and execute it with
 ``subprocess.run(cmd, shell=True, ...)``. Both ``rootfs`` and ``build_dir``
 flow in from the ``--build-dir`` CLI option (an unrestricted click.Path()),
 so a directory name containing shell metacharacters was executed as shell
-syntax rather than treated as a literal path. These tests prove the fix
-(an argv-list Popen pipeline with no shell involved) both blocks the
-injection and still produces a correct initramfs.
+syntax rather than treated as a literal path. The implementation no longer
+starts subprocesses at all: it serializes ``newc`` with the standard library.
 
 Note on the injection check: a directory name can never contain "/" (that's
 a filesystem-level restriction on any POSIX path component, not just a
@@ -22,9 +21,49 @@ shell ever getting a chance to reinterpret it.
 """
 
 import gzip
-import subprocess
+import os
+import stat
+
+import pytest
 
 from ebuild.cli.integration import _create_initramfs
+
+
+def _newc_members(data):
+    """Parse enough of ``newc`` to validate names, metadata, and contents."""
+    members = {}
+    offset = 0
+    while True:
+        header = data[offset:offset + 110]
+        assert len(header) == 110
+        assert header[:6] == b"070701"
+        fields = [int(header[i:i + 8], 16) for i in range(6, 110, 8)]
+        inode = fields[0]
+        mode = fields[1]
+        link_count = fields[4]
+        file_size = fields[6]
+        name_size = fields[11]
+
+        offset += 110
+        encoded_name = data[offset:offset + name_size]
+        assert encoded_name.endswith(b"\0")
+        name = os.fsdecode(encoded_name[:-1])
+        offset += name_size
+        offset += -offset % 4
+
+        contents = data[offset:offset + file_size]
+        assert len(contents) == file_size
+        offset += file_size
+        offset += -offset % 4
+        members[name] = {
+            "inode": inode,
+            "mode": mode,
+            "link_count": link_count,
+            "contents": contents,
+        }
+
+        if name == "TRAILER!!!":
+            return members
 
 
 def test_create_initramfs_produces_valid_gzip_with_expected_content(tmp_path):
@@ -47,13 +86,12 @@ def test_create_initramfs_produces_valid_gzip_with_expected_content(tmp_path):
         cpio_data = f.read()
     assert cpio_data.startswith(b"07070")  # newc cpio magic
 
-    # cpio -t lists member paths; our test file must be in there.
-    result = subprocess.run(
-        ["cpio", "-t"],
-        input=cpio_data,
-        capture_output=True,
-    )
-    assert b"hello.txt" in result.stdout
+    members = _newc_members(cpio_data)
+    assert "." in members
+    assert members["./hello.txt"]["contents"] == (
+        rootfs / "hello.txt"
+    ).read_bytes()
+    assert "TRAILER!!!" in members
 
 
 def test_create_initramfs_build_dir_with_shell_metacharacters_is_not_interpreted(tmp_path):
@@ -104,10 +142,76 @@ def test_create_initramfs_rootfs_with_shell_metacharacters_is_not_interpreted(tm
         cpio_data = f.read()
     assert cpio_data.startswith(b"07070")
 
-    # The pipeline must have actually cd'd into the evil rootfs (via `cwd=`,
-    # not a shell `cd`) and archived its real content.
-    result = subprocess.run(["cpio", "-t"], input=cpio_data, capture_output=True)
-    assert b"f.txt" in result.stdout
+    # The literal rootfs path must have supplied the archived content.
+    assert _newc_members(cpio_data)["./f.txt"]["contents"] == (
+        evil_rootfs / "f.txt"
+    ).read_bytes()
 
     assert not (tmp_path / "pwned_marker2").exists()
     assert not (build_dir / "pwned_marker2").exists()
+
+
+def test_create_initramfs_marks_shebang_scripts_executable(tmp_path):
+    rootfs = tmp_path / "rootfs"
+    bin_dir = rootfs / "bin"
+    bin_dir.mkdir(parents=True)
+    executable = bin_dir / "app"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    initramfs = _create_initramfs(rootfs, build_dir)
+
+    with gzip.open(initramfs, "rb") as archive:
+        members = _newc_members(archive.read())
+
+    assert stat.S_ISDIR(members["./bin"]["mode"])
+    assert stat.S_ISREG(members["./bin/app"]["mode"])
+    assert members["./bin/app"]["mode"] & 0o111 == 0o111
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows cannot reliably create symlinks"
+)
+def test_create_initramfs_preserves_symlink_target(tmp_path):
+    rootfs = tmp_path / "rootfs"
+    bin_dir = rootfs / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "app-link").symlink_to("app")
+
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    initramfs = _create_initramfs(rootfs, build_dir)
+
+    with gzip.open(initramfs, "rb") as archive:
+        members = _newc_members(archive.read())
+
+    assert stat.S_ISLNK(members["./bin/app-link"]["mode"])
+    assert members["./bin/app-link"]["contents"] == b"app"
+
+
+def test_create_initramfs_preserves_hard_links_without_duplicate_data(tmp_path):
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    first = rootfs / "first"
+    second = rootfs / "second"
+    payload = b"shared contents" * 64
+    first.write_bytes(payload)
+    os.link(first, second)
+
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    initramfs = _create_initramfs(rootfs, build_dir)
+
+    with gzip.open(initramfs, "rb") as archive:
+        members = _newc_members(archive.read())
+
+    first_record = members["./first"]
+    second_record = members["./second"]
+    assert first_record["inode"] == second_record["inode"]
+    assert first_record["link_count"] == second_record["link_count"] == 2
+    assert {first_record["contents"], second_record["contents"]} == {
+        b"",
+        payload,
+    }
