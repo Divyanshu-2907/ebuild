@@ -28,6 +28,7 @@ import yaml
 from ebuild import __version__
 from ebuild.build.ninja_backend import NinjaBackend, PackagePaths
 from ebuild.build.toolchain import resolve_toolchain
+from ebuild.cli.integration import register_commands as _register_integration_commands
 from ebuild.cli.logger import Logger
 from ebuild.core.config import ConfigError, load_config, ProjectConfig
 from ebuild.core.graph import CycleError, DependencyGraph, build_dependency_graph
@@ -2408,3 +2409,18 @@ def _serial_ports() -> List[str]:
     for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/tty.usb*"):
         found.extend(sorted(glob.glob(pattern)))
     return found
+
+
+# ═════════════════════════════════════════════════════════════
+#  Integration commands
+# ═════════════════════════════════════════════════════════════
+# `integration`, `qemu`, `sdk`, `package` and `models` live in
+# ebuild/cli/integration.py and are attached to the group by
+# register_commands(). That call used to live only in ebuild/__main__.py,
+# which runs for `python -m ebuild` and not for the `ebuild` console script
+# that pyproject.toml's [project.scripts] installs on PATH. The five
+# commands were therefore missing from the entry point that every user and
+# every doc actually invokes. Registering here attaches them to the group
+# itself, so both entry points -- and anything that imports `cli` -- see
+# the same CLI.
+_register_integration_commands(cli)
