@@ -909,6 +909,13 @@ ebuild install freertos        # Install specific package
 
 ### 12.5 Package Resolution
 
+When several recipes exist for the same package and no version is requested,
+the registry selects the highest one. Versions are compared component by
+component, numerically rather than as text, so `11.1.0` outranks `2.9.3`.
+Non-numeric versions are supported: a suffix after a hyphen marks a
+pre-release and lowers precedence (`3.6.0-rc1` < `3.6.0`), while a letter
+directly after a number marks a respin and raises it (`1.2.11` < `1.2.11b`).
+
 The package resolver handles version constraints and dependency ordering:
 
 ```
@@ -934,6 +941,23 @@ Request: freertos >= 10.5, mbedtls ^3.0
 | Fetch + Build     |  Download and compile
 +-------------------+
 ```
+
+#### Version ordering
+
+A request without a version resolves to the highest version of that package in
+the registry. `version` is a free-form string — the recipe format does not
+require dotted integers — so the ordering is defined as follows:
+
+| Rule | Example |
+|---|---|
+| A leading `v` or `V` is ignored | `v2.9.3` ranks with `2.9.3` |
+| All-digit components compare numerically | `1.10.0` > `1.9.0` |
+| Any other component compares as text, below any numeric one | `1.x` < `1.0` |
+| A `-` or `+` suffix ranks below the same version without one | `3.6.0-rc1` < `3.6.0` |
+
+Every version string has a place in this order, including ones that carry no
+numbers at all (`main`), so one unusual recipe cannot break lookup for the
+packages around it.
 
 ---
 

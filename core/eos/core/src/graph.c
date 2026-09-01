@@ -21,6 +21,7 @@ EosResult eos_graph_add_node(EosGraph *g, const char *name, EosNodeType type,
     int id = g->node_count;
     EosNode *n = &g->nodes[id];
     strncpy(n->name, name, EOS_MAX_NAME - 1);
+    n->name[EOS_MAX_NAME-1] = '\0';
     n->type = type;
     n->build_type = build_type;
     n->status = EOS_NODE_PENDING;

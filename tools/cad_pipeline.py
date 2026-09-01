@@ -62,6 +62,50 @@ class BoardDef:
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 
+def _sexpr_body(content: str, head: str) -> List[str]:
+    """Return the body of every ``(head ...)`` block, paren-matched.
+
+    A non-greedy ``(eos_cpu(.*?))`` regex stops at the FIRST ``)``, which in
+
+        (eos_cpu
+          (arch "aarch64")
+          (core "cortex-a57")
+
+    is the one closing ``(arch ...)``. Every attribute after the first then
+    fell out of the match and silently took its dataclass default, so a board
+    declaring cortex-a72 at 1800 MHz produced artifacts describing cortex-a57
+    at 1000, and every ``eos_peripheral`` came out as
+    ``unknown/unknown/0x0/irq -1``. Nothing reported an error -- the region and
+    peripheral *counts* were right, so the output looked plausible.
+
+    Depth counting handles nesting; quoted strings are skipped so a parenthesis
+    inside a name cannot unbalance the scan.
+    """
+    bodies = []
+    for m in re.finditer(r"\(" + re.escape(head) + r"(?![A-Za-z0-9_])", content):
+        i = m.end()
+        start = i
+        depth = 1
+        in_str = False
+        while i < len(content) and depth:
+            c = content[i]
+            if in_str:
+                if c == "\\":
+                    i += 1
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            bodies.append(content[start:i - 1])
+    return bodies
+
+
 def parse_kicad_pcb(path: str) -> BoardDef:
     """Parse a KiCad PCB file and extract EoS-specific annotations."""
     board = BoardDef()
@@ -93,9 +137,9 @@ def parse_kicad_pcb(path: str) -> BoardDef:
         ))
 
     # CPU definition
-    cpu_block = re.search(r'\(eos_cpu(.*?)\)', content, re.DOTALL)
-    if cpu_block:
-        cb = cpu_block.group(1)
+    cpu_bodies = _sexpr_body(content, "eos_cpu")
+    if cpu_bodies:
+        cb = cpu_bodies[0]
         def _attr(key):
             mm = re.search(rf'\({key}\s+"([^"]+)"\)', cb)
             return mm.group(1) if mm else None
@@ -115,8 +159,7 @@ def parse_kicad_pcb(path: str) -> BoardDef:
         )
 
     # Peripherals: (eos_peripheral (name "...") (compatible "...") (base "...") (irq N))
-    for pm in re.finditer(r'\(eos_peripheral(.*?)\)', content, re.DOTALL):
-        pb = pm.group(1)
+    for pb in _sexpr_body(content, "eos_peripheral"):
         def _p(key):
             mm = re.search(rf'\({key}\s+"([^"]+)"\)', pb)
             return mm.group(1) if mm else None
@@ -455,7 +498,11 @@ def main():
 
     for filename, content in artifacts.items():
         out_path = os.path.join(output_dir, filename)
-        with open(out_path, "w") as f:
+        # encoding="utf-8" to match the read side. The generated banners carry
+        # em dashes and box-drawing characters, and open() without an encoding
+        # uses the platform default -- cp1252 on Windows -- so the artifacts
+        # came out mangled there while the parser had always read UTF-8.
+        with open(out_path, "w", encoding="utf-8") as f:
             f.write(content)
         print(f"[ebuild cad_pipeline] Generated: {out_path}")
 
@@ -479,7 +526,7 @@ def main():
         "generated_artifacts": list(artifacts.keys()),
     }
     manifest_path = os.path.join(output_dir, "board_manifest.json")
-    with open(manifest_path, "w") as f:
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"[ebuild cad_pipeline] Manifest: {manifest_path}")
     print(f"[ebuild cad_pipeline] Done. {len(artifacts)+1} files written to {output_dir}/")

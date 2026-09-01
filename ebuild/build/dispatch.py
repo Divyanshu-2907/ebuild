@@ -13,7 +13,7 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,49 @@ TIER_2 = {"cmake", "meson"}
 TIER_3 = {"cargo"}
 
 ALL_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild", "ninja"}
+SUPPORTED_BACKENDS = TIER_1 | TIER_2 | TIER_3
+
+
+class BackendError(RuntimeError):
+    """Raised when the external dispatcher cannot handle a backend."""
+
+
+def _validate_backend(backend: str, supported: Set[str]) -> None:
+    """Reject values that the requested dispatcher operation cannot handle."""
+    if backend in supported:
+        return
+
+    if backend in ALL_BACKENDS:
+        message = f"BackendDispatcher cannot handle backend '{backend}'."
+    else:
+        message = f"Unknown build backend '{backend}'."
+
+    supported_names = ", ".join(sorted(supported))
+    raise BackendError(f"{message} Supported backends: {supported_names}.")
+
+#: Backends this dispatcher actually drives. "ninja" is ebuild's own backend --
+#: the CLI invokes NinjaBackend directly and never routes it through here.
+DISPATCHED_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild"}
+
+
+class UnknownBackendError(ValueError, RuntimeError):
+    """Raised when a backend reaches the dispatcher that it cannot drive.
+
+    Subclasses both ValueError and RuntimeError: callers treat an unrecognized
+    backend name as a bad argument, while the CLI treats a backend it failed to
+    route (notably "ninja") as a routing failure. Silently doing nothing here is
+    what made `ebuild build` report "Build completed successfully" without ever
+    running a compiler.
+    """
+
+
+def _unknown_backend(backend: str, step: str) -> UnknownBackendError:
+    return UnknownBackendError(
+        f"Unknown build backend '{backend}'. "
+        f"Supported backends: {', '.join(sorted(DISPATCHED_BACKENDS))}. "
+        "ebuild's own 'ninja' backend is invoked directly by the CLI and is "
+        f"not dispatched here, so it cannot be {step} through BackendDispatcher."
+    )
 
 
 def ninja_command():
@@ -117,8 +160,9 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            ValueError: If the backend is not recognized.
+            BackendError: If the backend cannot be configured here.
         """
+        _validate_backend(backend, SUPPORTED_BACKENDS)
         config = config or {}
         self.build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -141,14 +185,6 @@ class BackendDispatcher:
         elif backend in ("make", "kbuild"):
             pass  # No separate configure step
 
-        else:
-            raise RuntimeError(
-                f"BackendDispatcher cannot configure backend '{backend}'. "
-                "This dispatcher only handles cmake, meson, and cargo "
-                "(make/kbuild need no configure step). ebuild's own ninja "
-                "backend is generated and invoked by the CLI, not here."
-            )
-
     def build(
         self,
         backend: str,
@@ -164,8 +200,9 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            ValueError: If the backend is not recognized.
+            BackendError: If the backend cannot be built here.
         """
+        _validate_backend(backend, SUPPORTED_BACKENDS)
         config = config or {}
 
         if backend == "cmake":
@@ -194,14 +231,6 @@ class BackendDispatcher:
             cmd = ["make", "-C", str(self.source_dir)]
             _run_or_log(cmd, dry_run)
 
-        else:
-            raise RuntimeError(
-                f"BackendDispatcher cannot build backend '{backend}'. "
-                "Supported here: cargo, cmake, kbuild, make, meson. ebuild's own "
-                "ninja backend is generated and invoked by the CLI, not through "
-                "this dispatcher."
-            )
-
     def clean(
         self,
         backend: str,
@@ -215,10 +244,9 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            RuntimeError: If the backend is not recognized. configure() and
-                build() raise the same type for the same condition, so a
-                caller can guard all three with one ``except``.
+            BackendError: If the backend cannot be cleaned here.
         """
+        _validate_backend(backend, ALL_BACKENDS)
         if backend == "cmake":
             _run_or_log(
                 ["cmake", "--build", str(self.build_dir), "--target", "clean"],
@@ -249,9 +277,4 @@ class BackendDispatcher:
                 ninja_command() + ["-C", str(self.build_dir), "-t", "clean"],
                 dry_run,
                 check=False,
-            )
-        else:
-            raise RuntimeError(
-                f"Unknown build backend '{backend}'. "
-                f"Supported backends: {', '.join(sorted(ALL_BACKENDS))}"
             )

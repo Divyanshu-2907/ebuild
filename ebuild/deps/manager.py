@@ -14,7 +14,7 @@ import os
 import subprocess
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -29,6 +29,12 @@ from ebuild.deps import (
 
 # Known repo names
 KNOWN_REPOS = ("eos", "eboot")
+
+# Sibling directory names. GitHub and local checkouts often use eBoot.
+SIBLING_DIR_NAMES: Dict[str, Tuple[str, ...]] = {
+    "eos": ("eos",),
+    "eboot": ("eboot", "eBoot"),
+}
 
 # Environment variable names for path overrides
 ENV_PATH_VARS = {
@@ -46,7 +52,7 @@ class DepsManager:
     2. Environment variables ``EBUILD_EOS_PATH`` / ``EBUILD_EBOOT_PATH``
     3. ``~/.ebuild/config.yaml`` custom ``path:`` override
     4. ``~/.ebuild/repos/<name>/`` (cached git clone)
-    5. Sibling directory ``../<name>/`` (workspace layout)
+    5. Sibling directory ``../<name>/`` (workspace layout; ``eboot`` also tries ``eBoot``)
     6. Embedded ``core/<name>/`` (legacy fallback — prints deprecation warning)
     """
 
@@ -204,11 +210,13 @@ class DepsManager:
         if cached.is_dir():
             return cached
 
-        # 5. Sibling directory
+        # 5. Sibling directory (try documented aliases; Linux is case-sensitive)
         if project_dir:
-            sibling = project_dir.parent / repo_name
-            if sibling.is_dir():
-                return sibling
+            names = SIBLING_DIR_NAMES.get(repo_name, (repo_name,))
+            for name in names:
+                sibling = project_dir.parent / name
+                if sibling.is_dir():
+                    return sibling
 
         # 6. Legacy embedded core/<name>/ (deprecation warning)
         if project_dir:
