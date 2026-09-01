@@ -80,9 +80,9 @@ class TestNinjaPathEscaping(unittest.TestCase):
     """Ninja splits build statements on unescaped spaces and colons.
 
     A Windows absolute path puts a drive-letter colon into the output field, so
-    Ninja read the statement as a rule separator and every generated file was
-    rejected with "expected build command name" -- the backend produced no
-    usable build on Windows at all. Paths in build statements must be escaped;
+    Ninja read the statement as a rule separator and rejected every generated
+    file with "expected build command name" -- the backend produced no usable
+    build on Windows at all. Paths in build statements must be escaped;
     variable values must not be, or the flags reach the compiler mangled.
     """
 
@@ -98,27 +98,23 @@ class TestNinjaPathEscaping(unittest.TestCase):
         self.assertEqual(_ninja_path("/tmp/build/obj/app/src/main.o"),
                          "/tmp/build/obj/app/src/main.o")
 
+    def test_every_build_statement_has_one_unescaped_colon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp) / "b"
+            target = TargetConfig(name="app", target_type="executable",
+                                  sources=["main.c"])
+            config = ProjectConfig(name="proj", version="1.0", targets=[target],
+                                   source_dir=build_dir)
+            NinjaBackend(config, build_dir, _toolchain()).generate()
+            ninja = (build_dir / "build.ninja").read_text(encoding="utf-8")
 
-class TestNinjaWindowsStylePaths(unittest.TestCase):
-    def setUp(self):
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmpdir.cleanup)
-
-    def test_build_statement_output_is_escaped(self):
-        build_dir = Path(self._tmpdir.name) / "b"
-        target = TargetConfig(name="app", target_type="executable", sources=["main.c"])
-        config = ProjectConfig(name="proj", version="1.0", targets=[target],
-                               source_dir=build_dir)
-        NinjaBackend(config, build_dir, _toolchain()).generate()
-        ninja = (build_dir / "build.ninja").read_text(encoding="utf-8")
-
-        for line in ninja.splitlines():
-            if not line.startswith("build "):
-                continue
-            # Exactly one unescaped colon per build statement: the one that
-            # separates outputs from the rule name.
-            without_escapes = line.replace("$:", "").replace("$$", "")
-            self.assertEqual(without_escapes.count(":"), 1, line)
+            for line in ninja.splitlines():
+                if not line.startswith("build "):
+                    continue
+                # The only unescaped colon is the one separating outputs from
+                # the rule name.
+                stripped = line.replace("$:", "").replace("$$", "")
+                self.assertEqual(stripped.count(":"), 1, line)
 
 
 if __name__ == "__main__":
