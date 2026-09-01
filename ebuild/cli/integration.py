@@ -11,8 +11,10 @@ Provides CLI commands to:
 
 from __future__ import annotations
 
+import gzip
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +24,7 @@ import click
 
 from ebuild.cli.logger import Logger
 from ebuild.system.rootfs import RootfsBuilder
+from ebuild import __version__
 
 
 # Default sibling repo names and their build configs
@@ -191,11 +194,136 @@ def _build_rootfs(build_dir: Path, libs: List[Path], trigger: str,
     return rootfs
 
 
+def _newc_padding(length: int) -> bytes:
+    """Return the zero padding needed to align *length* to four bytes."""
+    return b"\0" * (-length % 4)
+
+
+def _newc_mode(path: Path, metadata) -> int:
+    """Return a POSIX file type and mode suitable for a ``newc`` record.
+
+    Windows reports regular files as non-executable even when they are shell
+    scripts or cross-compiled ELF binaries. Use conservative archive defaults
+    there and restore the execute bits only when file contents identify an
+    executable format. POSIX hosts retain the source mode unchanged.
+    """
+    mode = metadata.st_mode
+    if os.name != "nt":
+        return mode
+    if stat.S_ISDIR(mode):
+        return stat.S_IFDIR | 0o755
+    if stat.S_ISLNK(mode):
+        return stat.S_IFLNK | 0o777
+    if not stat.S_ISREG(mode):
+        return mode
+
+    permissions = 0o644 if mode & stat.S_IWRITE else 0o444
+    with path.open("rb") as source:
+        magic = source.read(4)
+    if magic.startswith(b"#!") or magic == b"\x7fELF":
+        permissions |= 0o111
+    return stat.S_IFREG | permissions
+
+
+def _write_newc_entry(
+    out, path: Path, name: str, metadata, inode: int, include_data: bool
+) -> None:
+    """Write one filesystem object as a ``newc`` cpio record."""
+    mode = _newc_mode(path, metadata)
+    inline_data = None
+
+    if stat.S_ISREG(mode):
+        file_size = metadata.st_size if include_data else 0
+    elif stat.S_ISLNK(mode):
+        inline_data = os.fsencode(os.readlink(path))
+        file_size = len(inline_data)
+    elif stat.S_ISDIR(mode):
+        file_size = 0
+    else:
+        raise ValueError(f"Unsupported initramfs file type: {path}")
+
+    encoded_name = os.fsencode(name) + b"\0"
+    fields = (
+        inode,
+        mode,
+        getattr(metadata, "st_uid", 0),
+        getattr(metadata, "st_gid", 0),
+        max(metadata.st_nlink, 1),
+        int(metadata.st_mtime),
+        file_size,
+        0, 0, 0, 0,
+        len(encoded_name),
+        0,
+    )
+    header = b"070701" + b"".join(
+        f"{value & 0xFFFFFFFF:08x}".encode("ascii") for value in fields
+    )
+    out.write(header)
+    out.write(encoded_name)
+    out.write(_newc_padding(len(header) + len(encoded_name)))
+
+    if inline_data is not None:
+        out.write(inline_data)
+    elif file_size:
+        with path.open("rb") as source:
+            shutil.copyfileobj(source, out)
+    out.write(_newc_padding(file_size))
+
+
+def _write_newc_trailer(out, inode: int) -> None:
+    """Terminate a ``newc`` archive with its required trailer record."""
+    name = b"TRAILER!!!\0"
+    fields = (inode, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, len(name), 0)
+    header = b"070701" + b"".join(
+        f"{value:08x}".encode("ascii") for value in fields
+    )
+    out.write(header)
+    out.write(name)
+    out.write(_newc_padding(len(header) + len(name)))
+
+
 def _create_initramfs(rootfs: Path, build_dir: Path) -> Path:
-    """Create a cpio+gzip initramfs from the rootfs."""
+    """Create a gzip-compressed ``newc`` initramfs from *rootfs*.
+
+    The serializer is intentionally self-contained: relying on a
+    ``find | cpio | gzip`` subprocess pipeline made integration builds depend
+    on three Unix executables and made the function unusable on Windows.
+    """
+    if not rootfs.is_dir():
+        raise ValueError(f"Rootfs directory does not exist: {rootfs}")
+
     initramfs = build_dir / "initramfs.cpio.gz"
-    cmd = f"cd {rootfs} && find . | cpio -o -H newc 2>/dev/null | gzip > {initramfs}"
-    subprocess.run(cmd, shell=True, capture_output=True)
+    entries = [rootfs, *sorted(rootfs.rglob("*"), key=lambda p: p.as_posix())]
+    hardlink_inodes = {}
+    hardlink_data_written = set()
+    next_inode = 1
+
+    with gzip.GzipFile(filename=str(initramfs), mode="wb", mtime=0) as out:
+        for path in entries:
+            metadata = path.lstat()
+            hardlink_key = None
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+                hardlink_key = (metadata.st_dev, metadata.st_ino)
+
+            inode = hardlink_inodes.get(hardlink_key)
+            if inode is None:
+                inode = next_inode
+                next_inode += 1
+                if hardlink_key is not None:
+                    hardlink_inodes[hardlink_key] = inode
+
+            include_data = (
+                hardlink_key is None or hardlink_key not in hardlink_data_written
+            )
+            relative_name = path.relative_to(rootfs).as_posix()
+            name = "." if path == rootfs else f"./{relative_name}"
+            _write_newc_entry(
+                out, path, name, metadata, inode, include_data
+            )
+            if hardlink_key is not None:
+                hardlink_data_written.add(hardlink_key)
+        _write_newc_trailer(out, next_inode)
+
     return initramfs
 
 
@@ -327,16 +455,10 @@ def register_commands(cli_group: click.Group) -> None:
         log.success(f"Rootfs: {rootfs} ({sum(1 for _ in rootfs.rglob('*') if _.is_file())} files)")
 
         # Create initramfs
-        if os.name != "nt":
-            log.step("Creating initramfs...")
-            initramfs = _create_initramfs(rootfs, build_path)
-            if initramfs.exists():
-                size_kb = initramfs.stat().st_size // 1024
-                log.success(f"Initramfs: {initramfs} ({size_kb}KB)")
-            else:
-                log.warning("Initramfs creation failed (cpio not available)")
-        else:
-            log.info("Initramfs creation skipped on Windows (requires cpio)")
+        log.step("Creating initramfs...")
+        initramfs = _create_initramfs(rootfs, build_path)
+        size_kb = initramfs.stat().st_size // 1024
+        log.success(f"Initramfs: {initramfs} ({size_kb}KB)")
 
         log.success(f"Integration build complete — {built} packages built")
 
@@ -417,7 +539,7 @@ def register_commands(cli_group: click.Group) -> None:
                 log.step("Creating initramfs...")
                 initramfs = _create_initramfs(rootfs, build_path)
             else:
-                log.error("QEMU boot requires Linux (cpio + QEMU).")
+                log.error("QEMU boot requires a Linux host kernel and QEMU.")
                 raise SystemExit(1)
         else:
             initramfs = build_path / "initramfs.cpio.gz"
@@ -503,7 +625,7 @@ def register_commands(cli_group: click.Group) -> None:
 
     @cli_group.command()
     @click.option("--target", required=True, help="Target hardware (e.g., raspi4)")
-    @click.option("--version", default="0.1.0", help="Release version")
+    @click.option("--version", default=__version__, help="Release version")
     @click.option("--build-dir", default="build", help="Build directory with compiled artifacts")
     @click.option("--output", default="dist", help="Output directory for deliverable")
     @click.option("--workspace", default=None, help="EoS workspace root (auto-detect)")

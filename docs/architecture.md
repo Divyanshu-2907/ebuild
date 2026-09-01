@@ -122,6 +122,22 @@ Dispatches builds to the appropriate backend based on the project's build system
 | Kbuild | Linux kernel builds |
 | Ninja | Custom ebuild backend |
 
+#### Incremental correctness in the Ninja backend
+
+The generated `cc` rule compiles with `-MMD -MF $out.d` and declares
+`depfile = $out.d` / `deps = gcc`. The compiler writes out the list of headers
+each object actually pulled in, and Ninja folds that list into its dependency
+graph.
+
+This matters because `build.yaml` only lists *sources*. Without a depfile Ninja
+has no way to learn that `main.o` includes `mathlib.h`, so editing a header
+would leave the stale object in place and the build would report success. The
+depfile is what makes `ebuild build` safe to run incrementally.
+
+The flags assume a GCC-compatible driver (`gcc`, `clang`, `arm-none-eabi-gcc`),
+which is the same assumption the rest of the generated rules already make with
+`-I`, `-D`, `-c` and `-o`.
+
 The **toolchain manager** (`toolchain.py`) maintains 5 predefined cross-compilation toolchains:
 
 - `host` — native x86_64

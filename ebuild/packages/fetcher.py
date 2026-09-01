@@ -13,6 +13,7 @@ import hashlib
 import tarfile
 import zipfile
 from pathlib import Path
+from typing import Optional
 from urllib.request import urlretrieve
 
 from ebuild.packages.recipe import PackageRecipe
@@ -48,7 +49,15 @@ class PackageFetcher:
         """
         archive_path = self._download(recipe)
         if recipe.checksum:
-            self._verify_checksum(archive_path, recipe.checksum)
+            try:
+                self._verify_checksum(archive_path, recipe.checksum)
+            except FetchError:
+                # A mismatching archive is worthless, and _download()
+                # short-circuits on existence — leaving it in the cache made
+                # every later build fail with the same error until someone
+                # deleted it by hand. Drop it so a retry re-downloads.
+                archive_path.unlink(missing_ok=True)
+                raise
         extract_path = Path(extract_to)
         self._extract(archive_path, extract_path)
         return extract_path
@@ -63,14 +72,14 @@ class PackageFetcher:
                 f"(only http:// and https:// are allowed)"
             )
 
-        filename = self._archive_filename(recipe)
-        if not filename:
+        archive_path = self._archive_path(recipe)
+        if archive_path is None:
             raise FetchError(f"Could not derive filename from URL: {recipe.url}")
-        archive_path = self.download_dir / filename
 
         if archive_path.exists():
             return archive_path
 
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             urlretrieve(recipe.url, str(archive_path))
         except Exception as e:
@@ -109,34 +118,103 @@ class PackageFetcher:
         try:
             if name.endswith((".tar.gz", ".tgz")):
                 with tarfile.open(archive_path, "r:gz") as tar:
-                    tar.extractall(extract_to, filter="data")
+                    self._extract_tar(tar, extract_to)
             elif name.endswith((".tar.bz2", ".tbz2")):
                 with tarfile.open(archive_path, "r:bz2") as tar:
-                    tar.extractall(extract_to, filter="data")
+                    self._extract_tar(tar, extract_to)
             elif name.endswith((".tar.xz", ".txz")):
                 with tarfile.open(archive_path, "r:xz") as tar:
-                    tar.extractall(extract_to, filter="data")
+                    self._extract_tar(tar, extract_to)
             elif name.endswith(".zip"):
                 with zipfile.ZipFile(archive_path, "r") as zf:
-                    for member in zf.namelist():
-                        member_path = Path(extract_to) / member
-                        resolved = member_path.resolve()
-                        if not str(resolved).startswith(str(Path(extract_to).resolve())):
-                            raise FetchError(
-                                f"Zip path traversal detected: {member}"
-                            )
-                    zf.extractall(extract_to)
+                    self._extract_zip(zf, extract_to)
             else:
                 raise FetchError(f"Unsupported archive format: {archive_path.name}")
-        except (tarfile.TarError, zipfile.BadZipFile) as e:
+        except FetchError:
+            raise
+        except (tarfile.TarError, zipfile.BadZipFile, OSError) as e:
             raise FetchError(f"Failed to extract {archive_path.name}: {e}")
+
+    @staticmethod
+    def _path_is_within(base: Path, target: Path) -> bool:
+        """Return True if *target* resolves strictly inside *base*.
+
+        Uses Path.relative_to rather than a string prefix check so that
+        ``/tmp/extract-evil`` is not treated as inside ``/tmp/extract``.
+        """
+        try:
+            target.resolve().relative_to(base.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _extract_tar(self, tar: tarfile.TarFile, extract_to: Path) -> None:
+        """Extract a tar archive, compatible with Python 3.8–3.11 and 3.12+.
+
+        ``filter='data'`` (CVE-2007-4559 mitigation) was added in Python 3.12.
+        README and pyproject.toml claim support for Python 3.8+, so older
+        interpreters must extract without that keyword and with an explicit
+        member-path check instead.
+        """
+        if hasattr(tarfile, "data_filter"):
+            try:
+                tar.extractall(extract_to, filter="data")
+            except Exception as e:
+                # 3.12+ raises FilterError / OutsideDestinationError for
+                # members that would extract outside extract_to.
+                err_name = type(e).__name__
+                if "Filter" in err_name or "Outside" in err_name or "Absolute" in err_name:
+                    raise FetchError(f"Tar path traversal detected: {e}") from e
+                raise
+            return
+
+        extract_root = extract_to.resolve()
+        for member in tar.getmembers():
+            dest = extract_to / member.name
+            if not self._path_is_within(extract_root, dest):
+                raise FetchError(f"Tar path traversal detected: {member.name}")
+            if member.issym() or member.islnk():
+                link_dest = dest.parent / member.linkname
+                if Path(member.linkname).is_absolute():
+                    link_dest = Path(member.linkname)
+                if not self._path_is_within(extract_root, link_dest):
+                    raise FetchError(
+                        f"Tar link path traversal detected: {member.name} -> {member.linkname}"
+                    )
+        tar.extractall(extract_to)
+
+    def _extract_zip(self, zf: zipfile.ZipFile, extract_to: Path) -> None:
+        """Extract a zip archive after rejecting path-traversal members."""
+        extract_root = extract_to.resolve()
+        for member in zf.namelist():
+            if not self._path_is_within(extract_root, extract_to / member):
+                raise FetchError(f"Zip path traversal detected: {member}")
+        zf.extractall(extract_to)
 
     def _archive_filename(self, recipe: PackageRecipe) -> str:
         """Derive archive filename from recipe URL."""
         url_path = recipe.url.rstrip("/")
         return url_path.split("/")[-1]
 
+    def _archive_path(self, recipe: PackageRecipe) -> Optional[Path]:
+        """Cache path for *recipe*'s archive, namespaced by package slug.
+
+        The URL basename alone does not identify a package. GitHub tag
+        archives — ``.../archive/refs/tags/v2.9.3.tar.gz``, the form used by
+        ``recipes/littlefs.yaml`` — reduce to ``v2.9.3.tar.gz`` and carry no
+        package name, so two recipes sharing a tag would map to the same file
+        in the flat download directory. Namespacing by ``recipe.slug``
+        (name-version) keeps each package separate and matches the layout
+        PackageCache already uses.
+
+        Returns None when no filename can be derived from the URL.
+        """
+        filename = self._archive_filename(recipe)
+        if not filename:
+            return None
+        return self.download_dir / recipe.slug / filename
+
     def is_downloaded(self, recipe: PackageRecipe) -> bool:
         """Check if the archive is already downloaded."""
-        filename = self._archive_filename(recipe)
-        return (self.download_dir / filename).exists()
+        archive_path = self._archive_path(recipe)
+        return archive_path is not None and archive_path.exists()

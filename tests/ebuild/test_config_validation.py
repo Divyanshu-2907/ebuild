@@ -59,3 +59,40 @@ def test_backend_config_must_be_mapping(tmp_path):
 
     with pytest.raises(ConfigError, match="'backend_config' must be a mapping"):
         load_config(path)
+
+
+def test_toolchain_must_be_mapping(tmp_path):
+    path = write_config(
+        tmp_path,
+        {"project": {"name": "demo"}, "toolchain": "arm-none-eabi"},
+    )
+
+    with pytest.raises(ConfigError, match="'toolchain' must be a mapping"):
+        load_config(path)
+
+
+def test_toolchain_mapping_is_parsed(tmp_path):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "demo"},
+            "toolchain": {
+                "compiler": "arm-none-eabi",
+                "arch": "arm",
+                "prefix": "arm-none-eabi-",
+                "sysroot": "/opt/arm-none-eabi",
+                "extra_cflags": ["-mcpu=cortex-m4"],
+                "extra_ldflags": ["--specs=nosys.specs"],
+            },
+        },
+    )
+
+    config = load_config(path)
+
+    assert config.toolchain is not None
+    assert config.toolchain.compiler == "arm-none-eabi"
+    assert config.toolchain.arch == "arm"
+    assert config.toolchain.prefix == "arm-none-eabi-"
+    assert config.toolchain.sysroot == "/opt/arm-none-eabi"
+    assert config.toolchain.extra_cflags == ["-mcpu=cortex-m4"]
+    assert config.toolchain.extra_ldflags == ["--specs=nosys.specs"]

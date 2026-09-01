@@ -14,6 +14,7 @@ Every build releases:
 
 Output: eos-{target}-v{version}-deliverable.zip
 """
+from ebuild import __version__
 import os
 import json
 import shutil
@@ -212,7 +213,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="EoS Deliverable Packager")
     p.add_argument("--target", required=True,
                    help="Target hardware: " + ", ".join(sorted(TARGET_ARCH.keys())))
-    p.add_argument("--version", default="0.1.0")
+    p.add_argument("--version", default=__version__, help="Release version (default: current ebuild version)")
     p.add_argument("--build-dir", default="build")
     p.add_argument("--output", default="dist")
     p.add_argument("--workspace", default=None,

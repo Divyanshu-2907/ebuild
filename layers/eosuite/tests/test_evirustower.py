@@ -236,3 +236,120 @@ class TestEVirusTowerGUI:
         assert s._files_scanned == 1
         assert len(s._threats) == 1
         assert "Destructive Command" in s._threats[0]["threat"]
+
+
+class TestRemoteScanCommandInjection:
+    """Regression tests for the command-injection fix in the "Remote Scan
+    (Client)" feature (_build_remote_find_cmd / _build_remote_cat_cmd).
+
+    The old code built a single shell string (embedding host/user/port/
+    rpath/depth, and separately fpath -- a filename read back from the
+    remote host's own `find` output) and ran it with
+    subprocess.run(cmd, shell=True, ...). Any of those values containing
+    shell metacharacters was interpreted by the LOCAL shell before ssh was
+    even invoked. That made the "Remote Path" / "Max Depth" GUI fields
+    locally exploitable, and, more seriously, meant a maliciously-named
+    file merely present on the machine being scanned could run arbitrary
+    commands on the operator's own machine the moment a remote scan
+    reached it. The fix builds an argv list instead, so no local shell is
+    ever involved.
+    """
+
+    def test_build_remote_find_cmd_returns_argv_list(self):
+        from gui.apps.evirustower import _build_remote_find_cmd
+        cmd = _build_remote_find_cmd("host.example", "alice", "2222", "/data", "5")
+        assert isinstance(cmd, list)
+        assert cmd[0] == "ssh"
+        assert "alice@host.example" in cmd
+
+    def test_build_remote_cat_cmd_returns_argv_list(self):
+        from gui.apps.evirustower import _build_remote_cat_cmd
+        cmd = _build_remote_cat_cmd("host.example", "alice", "2222", "/data/report.txt")
+        assert isinstance(cmd, list)
+        assert cmd[0] == "ssh"
+        assert "alice@host.example" in cmd
+
+    def test_remote_find_cmd_string_round_trips_malicious_rpath(self):
+        """The remote command string (the last argv element, which ssh
+        hands to a shell on the remote end) must, when tokenized the same
+        way a POSIX shell would, reproduce rpath as exactly one token --
+        proof shlex.quote() neutralizes it for the remote shell too, not
+        just the local one."""
+        import shlex
+        from gui.apps.evirustower import _build_remote_find_cmd
+        malicious_rpath = '/tmp"; rm -rf ~; echo "'
+        cmd = _build_remote_find_cmd("h", "u", "22", malicious_rpath, "3")
+        tokens = shlex.split(cmd[-1])
+        assert malicious_rpath in tokens
+
+    def test_remote_cat_cmd_string_round_trips_malicious_fpath(self):
+        import shlex
+        from gui.apps.evirustower import _build_remote_cat_cmd
+        malicious_fpath = "report.txt'; rm -rf ~; echo '"
+        cmd = _build_remote_cat_cmd("h", "u", "22", malicious_fpath)
+        tokens = shlex.split(cmd[-1])
+        assert malicious_fpath in tokens
+
+    def test_old_shell_true_pattern_was_actually_exploitable_via_rpath(self, tmp_path):
+        """Proves the bug this PR closes was real, not theoretical.
+
+        This reproduces the exact formula the code used before this fix
+        (production code no longer builds commands this way -- this is a
+        standalone demonstration). It needs no network access and no real
+        ssh server: bash command substitution runs during word expansion,
+        before the outer `ssh ...` command is even looked up, so the
+        injected `touch` fires locally regardless of whether ssh succeeds,
+        fails, or isn't installed at all.
+        """
+        import subprocess
+        marker = tmp_path / "pwned_by_rpath"
+        malicious_rpath = f"/tmp $(touch {marker})"
+        port, user, host, depth = "22", "root", "example.invalid", "3"
+        old_style_cmd = (
+            f'ssh -p {port} -o ConnectTimeout=10 -o StrictHostKeyChecking=no '
+            f'{user}@{host} "find {malicious_rpath} -maxdepth {depth} '
+            f'-type f -size -50M 2>/dev/null"'
+        )
+        subprocess.run(old_style_cmd, shell=True, capture_output=True, timeout=10)
+        assert marker.exists(), (
+            "expected the injected `touch` inside rpath to run locally "
+            "under the old shell=True pattern"
+        )
+
+    def test_new_find_cmd_does_not_locally_execute_injected_rpath(self, tmp_path):
+        from gui.apps.evirustower import _build_remote_find_cmd
+        import subprocess
+        marker = tmp_path / "pwned_by_rpath_v2"
+        malicious_rpath = f"/tmp $(touch {marker})"
+        cmd = _build_remote_find_cmd("example.invalid", "root", "22", malicious_rpath, "3")
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except FileNotFoundError:
+            pass  # ssh not installed in this environment -- irrelevant to the check below
+        except subprocess.TimeoutExpired:
+            pass  # no network reachable -- also irrelevant to the check below
+        assert not marker.exists(), (
+            "the injected command substitution must never run locally now "
+            "that no shell parses this argument list"
+        )
+
+    def test_new_cat_cmd_does_not_locally_execute_injected_remote_filename(self, tmp_path):
+        """The more serious half of the bug: fpath here stands in for a
+        filename read back from the scanned remote host, not operator
+        input. A malicious remote filename must not be able to run
+        anything on the local machine."""
+        from gui.apps.evirustower import _build_remote_cat_cmd
+        import subprocess
+        marker = tmp_path / "pwned_by_remote_filename"
+        malicious_fpath = f"$(touch {marker})"
+        cmd = _build_remote_cat_cmd("example.invalid", "root", "22", malicious_fpath)
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except FileNotFoundError:
+            pass
+        except subprocess.TimeoutExpired:
+            pass
+        assert not marker.exists(), (
+            "a maliciously-named file on the scanned remote host must not "
+            "be able to run commands on the local machine"
+        )

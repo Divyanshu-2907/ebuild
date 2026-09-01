@@ -9,9 +9,12 @@ pipeline, and hardware analysis commands.
 
 from __future__ import annotations
 
+import glob
 import os
+import re
 import shutil
 import subprocess
+import threading
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -27,7 +30,8 @@ from ebuild.build.ninja_backend import NinjaBackend, PackagePaths
 from ebuild.build.toolchain import resolve_toolchain
 from ebuild.cli.logger import Logger
 from ebuild.core.config import ConfigError, load_config, ProjectConfig
-from ebuild.core.graph import CycleError, build_dependency_graph
+from ebuild.core.graph import CycleError, DependencyGraph, build_dependency_graph
+from ebuild.core.scheduler import run_graph
 from ebuild.packages.builder import BuildError, PackageBuilder
 from ebuild.packages.cache import PackageCache
 from ebuild.packages.fetcher import FetchError, PackageFetcher
@@ -64,8 +68,13 @@ def _install_packages(
     build_dir: Path,
     log: Logger,
     verbose: bool = False,
+    jobs: int = 1,
 ) -> Dict[str, PackagePaths]:
     """Resolve, fetch, build, and return PackagePaths for all declared packages.
+
+    Args:
+        jobs: Maximum packages to build concurrently. 1 (the default) preserves
+            the sequential build order exactly.
 
     Returns a dict mapping package name to PackagePaths for use by NinjaBackend.
     """
@@ -97,31 +106,66 @@ def _install_packages(
     cache = PackageCache(pkg_cache_dir)
     fetcher = PackageFetcher(pkg_cache_dir / "_downloads")
 
-    # Build each package in order
+    # Build each package, honouring dependency order. Independent packages run
+    # concurrently when jobs > 1.
     builder = PackageBuilder(cache, verbose=verbose)
     install_dirs: Dict[str, Path] = {}
+    by_name = {r.name: r for r in resolved}
 
+    graph = DependencyGraph()
     for recipe in resolved:
-        if cache.is_built(recipe):
-            log.info(f"  {recipe.name} v{recipe.version} — cached ✓")
-            install_dirs[recipe.name] = cache.install_dir(recipe)
-            continue
+        graph.add_node(recipe.name)
+    for recipe in resolved:
+        for dep in recipe.dependencies:
+            if dep in by_name:
+                graph.add_edge(recipe.name, dep)
 
-        log.step(f"  Fetching {recipe.name} v{recipe.version}...")
+    dirs_lock = threading.Lock()
+    log_lock = threading.Lock()
+
+    def build_one(name: str) -> Path:
+        recipe = by_name[name]
+
+        if cache.is_built(recipe):
+            with dirs_lock:
+                install_dirs[name] = cache.install_dir(recipe)
+            with log_lock:
+                log.info(f"  {recipe.name} v{recipe.version} — cached ✓")
+            return install_dirs[name]
+
+        with log_lock:
+            log.step(f"  Fetching {recipe.name} v{recipe.version}...")
         fetcher.fetch(recipe, cache.src_dir(recipe))
 
-        log.step(f"  Building {recipe.name} v{recipe.version}...")
+        with log_lock:
+            log.step(f"  Building {recipe.name} v{recipe.version}...")
+
         dep_dirs = []
         for dep in recipe.dependencies:
-            if dep not in install_dirs:
+            with dirs_lock:
+                dep_dir = install_dirs.get(dep)
+            if dep_dir is None:
                 raise BuildError(
                     f"Dependency '{dep}' of '{recipe.name}' was not built. "
                     "Check that all recipes are available."
                 )
-            dep_dirs.append(install_dirs[dep])
+            dep_dirs.append(dep_dir)
+
         install_dir = builder.build(recipe, dep_install_dirs=dep_dirs)
-        install_dirs[recipe.name] = install_dir
-        log.success(f"  {recipe.name} v{recipe.version} — built ✓")
+        with dirs_lock:
+            install_dirs[name] = install_dir
+        with log_lock:
+            log.success(f"  {recipe.name} v{recipe.version} — built ✓")
+        return install_dir
+
+    def note_skipped(name: str, _cause: BaseException) -> None:
+        with log_lock:
+            log.warning(f"  {name} — skipped (a dependency failed)")
+
+    if jobs > 1:
+        log.debug(f"Building packages with up to {jobs} concurrent jobs")
+
+    run_graph(graph, build_one, jobs=jobs, on_skip=note_skipped)
 
     # Update lockfile
     lockfile.lock(resolved)
@@ -145,6 +189,95 @@ def _install_packages(
     return package_paths
 
 
+def _workspace_repo_paths() -> Dict[str, PackagePaths]:
+    """Include paths for the eos and eboot repos that `ebuild setup` cloned.
+
+    A scaffolded project includes <eos/hal.h>, but the generated build.yaml
+    carried no path to the headers, so every template failed with
+    "fatal error: eos/hal.h: No such file or directory" on the first build.
+
+    These are resolved at build time from the cache rather than written into
+    build.yaml as absolute paths: the path is a fact about this machine, and
+    build.yaml is a file the developer commits.
+
+    Returns an empty mapping when the cache is absent, so the error a developer
+    sees stays the missing header rather than a stack trace, and `ebuild setup`
+    remains the fix.
+    """
+    from ebuild.deps import EBUILD_REPOS_DIR
+
+    paths: Dict[str, PackagePaths] = {}
+    for name in ("eos", "eboot"):
+        root = Path(EBUILD_REPOS_DIR) / name
+        if not root.is_dir():
+            continue
+        # Headers sit at two depths: kernel/include, hal/include ... and
+        # services/crypto/include, services/ota/include. Both are needed --
+        # <eos/crypto.h> and <eos/ota.h> live only in the deeper set.
+        include_dirs = sorted(
+            {p for pattern in ("include", "*/include", "*/*/include")
+             for p in root.glob(pattern) if p.is_dir()}
+        )
+        if include_dirs:
+            lib_dirs, libraries = _cached_repo_libraries(root)
+            paths[name] = PackagePaths(
+                include_dirs=include_dirs,
+                lib_dirs=lib_dirs,
+                libraries=libraries,
+            )
+    return paths
+
+
+# Where `ebuild` puts the CMake build tree for a cached repo. Kept inside the
+# clone so `ebuild setup` remains the only thing that owns ~/.ebuild/repos.
+_REPO_BUILD_DIRNAME = "_ebuild"
+
+
+def _cached_repo_libraries(root: Path) -> Tuple[List[Path], List[str]]:
+    """Static libraries a cached repo offers to projects that `use` it.
+
+    Headers alone are not enough: a scaffolded project compiles against
+    <eos/hal.h> and then fails at the link step with undefined references.
+    The repo is a CMake project with no install() rules, so there is nothing
+    to point a -L at until it has been built once. Build it on demand and
+    cache the result; subsequent builds reuse the tree.
+
+    Returns ([], []) when the repo cannot be built here — a missing cmake, a
+    repo that is not a CMake project — so the developer still gets a link
+    error naming the symbol rather than a stack trace from ebuild.
+    """
+    if not (root / "CMakeLists.txt").is_file():
+        return [], []
+
+    build_dir = root / _REPO_BUILD_DIRNAME
+    archives = sorted(build_dir.rglob("*.a")) if build_dir.is_dir() else []
+
+    if not archives:
+        if shutil.which("cmake") is None:
+            return [], []
+        try:
+            subprocess.run(
+                ["cmake", "-S", str(root), "-B", str(build_dir)],
+                check=True, capture_output=True, timeout=600,
+            )
+            subprocess.run(
+                ["cmake", "--build", str(build_dir), "-j", str(os.cpu_count() or 1)],
+                check=True, capture_output=True, timeout=1800,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return [], []
+        archives = sorted(build_dir.rglob("*.a"))
+
+    if not archives:
+        return [], []
+
+    # -L one directory per archive location; -l the archive basenames with
+    # the lib prefix and .a suffix stripped, which is what the linker wants.
+    lib_dirs = sorted({a.parent for a in archives})
+    libraries = [a.stem[3:] for a in archives if a.stem.startswith("lib")]
+    return lib_dirs, libraries
+
+
 def _detect_libraries(lib_dir: Path, pkg_name: str) -> List[str]:
     """Detect installed library names from a lib/ directory."""
     if not lib_dir.exists():
@@ -165,7 +298,158 @@ def _detect_libraries(lib_dir: Path, pkg_name: str) -> List[str]:
     return libs if libs else [pkg_name]
 
 
+def _resolve_backend_request(
+    cfg: ProjectConfig,
+    backend_override: Optional[str],
+    source_dir: Path,
+    log: Logger,
+) -> Tuple[str, Dict[str, Any]]:
+    """Resolve the effective backend and backend-specific config."""
+    resolved_backend = backend_override or cfg.backend
+    backend_config = dict(cfg.backend_config)
+
+    if resolved_backend == "auto":
+        from ebuild.build.dispatch import detect_backend
+
+        resolved_backend = detect_backend(source_dir)
+        log.info(f"Auto-detected backend: {resolved_backend}")
+
+    return resolved_backend, backend_config
+
+
+def _configure_ninja_backend(
+    cfg: ProjectConfig,
+    build_path: Path,
+    log: Logger,
+    *,
+    suggest_build: bool = True,
+) -> None:
+    """Generate native ebuild Ninja files for configure-only workflows.
+
+    The package paths are merged exactly as `ebuild build` merges them. If
+    they were not, `configure` and `build` would each write a different
+    build.ninja to the same path, and a developer who ran `configure` and then
+    invoked ninja directly would build without the cached-repo include and
+    library paths.
+    """
+    log.step("Resolving toolchain...")
+    compiler = resolve_toolchain(cfg.toolchain)
+
+    package_paths = {**_workspace_repo_paths(),
+                     **_install_packages(cfg, build_path, log, verbose=log.verbose)}
+
+    log.step(f"Generating build.ninja in {build_path}/...")
+    ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
+    ninja_backend.generate()
+
+    log.success(f"Generated {build_path / 'build.ninja'}")
+    log.success(f"Generated {build_path / 'compile_commands.json'}")
+    if suggest_build:
+        log.info("Run 'ebuild build' to compile.")
+
+
+def _configure_external_backend(
+    cfg: ProjectConfig,
+    resolved_backend: str,
+    backend_config: Dict[str, Any],
+    build_path: Path,
+    log: Logger,
+) -> None:
+    """Run configure behavior for dispatcher-backed build systems."""
+    from ebuild.build.dispatch import BackendDispatcher
+
+    no_configure_backends = {"cargo", "make", "kbuild"}
+
+    log.step(f"Using {resolved_backend} backend...")
+    if resolved_backend in no_configure_backends:
+        log.info(f"No separate configure step for {resolved_backend}.")
+        return
+
+    dispatcher = BackendDispatcher(cfg.source_dir, build_path)
+    log.step(f"Configuring ({resolved_backend})...")
+    dispatcher.configure(
+        backend=resolved_backend,
+        config=backend_config,
+    )
+    log.success(f"Configuration completed successfully ({resolved_backend}).")
+
+
+def _format_subprocess_failure(exc: subprocess.CalledProcessError) -> str:
+    """Format a subprocess failure for user-facing CLI output."""
+    cmd = exc.cmd
+    if isinstance(cmd, (list, tuple)):
+        cmd_str = " ".join(str(part) for part in cmd)
+    else:
+        cmd_str = str(cmd)
+
+    return f"Command failed (exit code {exc.returncode}): {cmd_str}"
+
+
+def _format_missing_tool(exc: FileNotFoundError) -> str:
+    """Format missing executable/path errors for user-facing CLI output."""
+    if exc.filename:
+        return f"Required tool or file not found: {exc.filename}"
+    return str(exc)
+
+
 # ═══════════════════════════════════════════════════════════════
+#  Board selection — shared by `configure --board` and `monitor`
+# ---------------------------------------------------------------------------
+
+# The project-local file that records which board this checkout targets.
+_EOS_PROJECT_CONFIG = "eos.yaml"
+
+
+def _record_board_selection(board: str, log: Logger) -> None:
+    """Persist ``--board`` into eos.yaml under ``system.board``.
+
+    The golden path is `configure --board` then a bare `build`, so the choice
+    has to outlive the configure process. It is written to eos.yaml rather
+    than build.yaml because the board is a property of the system being
+    targeted, which is what eos.yaml already describes.
+    """
+    path = Path(_EOS_PROJECT_CONFIG)
+    if not path.is_file():
+        log.error(
+            f"No {_EOS_PROJECT_CONFIG} here, so there is nothing to record the "
+            f"board against. Run this from a project directory created by "
+            f"'ebuild new'."
+        )
+        raise SystemExit(1)
+
+    import yaml
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as e:
+        log.error(f"{_EOS_PROJECT_CONFIG} is not valid YAML: {e}")
+        raise SystemExit(1)
+
+    system = data.setdefault("system", {})
+    previous = system.get("board")
+    system["board"] = board
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    if previous and previous != board:
+        log.info(f"Board: {previous} -> {board}")
+    else:
+        log.info(f"Board: {board}")
+
+
+def _selected_board(default: str = "generic") -> str:
+    """The board recorded by ``configure --board``, or ``default``."""
+    path = Path(_EOS_PROJECT_CONFIG)
+    if not path.is_file():
+        return default
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return default
+    return (data.get("system") or {}).get("board") or default
+
+
+# ---------------------------------------------------------------------------
 #  Pipeline helper — shared by `pipeline` and `build --board`
 # ═══════════════════════════════════════════════════════════════
 
@@ -453,9 +737,21 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     type=click.Path(exists=True),
     help="Hardware design file (.kicad_sch, .sch, .csv). Used with --board for analysis.",
 )
+@click.option(
+    "-j",
+    "--jobs",
+    default=1,
+    type=click.IntRange(min=1),
+    help=(
+        "Number of packages to build concurrently (default 1). Independent "
+        "packages are built in parallel; dependency order is always honoured. "
+        "Each package's own build may already run parallel compile jobs, so "
+        "large values can oversubscribe the machine."
+    ),
+)
 @click.pass_obj
 def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
-          board: Optional[str], hardware: Optional[str]) -> None:
+          board: Optional[str], hardware: Optional[str], jobs: int = 1) -> None:
     """Parse config, detect backend, and build the project.
 
     When --board is provided, runs the full pipeline (analyze -> generate ->
@@ -495,13 +791,12 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         log.info(f"Project: {cfg.name} v{cfg.version}")
 
         build_path = Path(build_dir)
-        resolved_backend = backend or cfg.backend
-
-        # Auto-detect from project files if needed
-        if resolved_backend == "auto":
-            from ebuild.build.dispatch import detect_backend
-            resolved_backend = detect_backend(cfg.source_dir)
-            log.info(f"Auto-detected backend: {resolved_backend}")
+        resolved_backend, backend_config = _resolve_backend_request(
+            cfg=cfg,
+            backend_override=backend,
+            source_dir=cfg.source_dir,
+            log=log,
+        )
 
         # Route: external build systems (cmake, make, meson, cargo, kbuild)
         # go through the dispatcher. ebuild's own ninja backend handles
@@ -518,14 +813,14 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
                 log.step(f"Configuring ({resolved_backend})...")
                 dispatcher.configure(
                     backend=resolved_backend,
-                    config=cfg.backend_config,
+                    config=backend_config,
                 )
 
             # Build
             log.step(f"Building ({resolved_backend})...")
             dispatcher.build(
                 backend=resolved_backend,
-                config=cfg.backend_config,
+                config=backend_config,
             )
 
             log.success(f"Build completed successfully ({resolved_backend}).")
@@ -542,7 +837,8 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         log.debug(f"Compiler: {compiler.cc}")
 
         # Install packages if any are declared
-        package_paths = _install_packages(cfg, build_path, log, verbose=log.verbose)
+        package_paths = {**_workspace_repo_paths(),
+                         **_install_packages(cfg, build_path, log, verbose=log.verbose, jobs=jobs)}
 
         log.step(f"Generating build.ninja in {build_path}/...")
         ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
@@ -551,21 +847,34 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         log.success(f"Generated {build_path / 'compile_commands.json'}")
 
         log.step("Invoking ninja...")
-        ninja_cmd = [sys.executable, "-m", "ninja", "-f", str(build_path / "build.ninja")]
+        from ebuild.build.dispatch import ninja_command
+        ninja_cmd = ninja_command() + ["-f", str(build_path / "build.ninja")]
         if log.verbose:
             ninja_cmd.append("-v")
 
         result = subprocess.run(ninja_cmd, capture_output=not log.verbose, cwd=str(cfg.source_dir))
         if result.returncode != 0:
-            if not log.verbose and result.stderr:
-                log.error(result.stderr.decode(errors="replace"))
+            # ninja reports compiler diagnostics on stdout, not stderr, so a
+            # failure surfaced only through stderr says nothing about what broke.
+            # Replay both streams verbatim rather than through log.error(), which
+            # would prefix a multi-line diagnostic with a single "[error]" tag.
+            if not log.verbose:
+                if result.stdout:
+                    sys.stdout.write(result.stdout.decode(errors="replace"))
+                    sys.stdout.flush()
+                if result.stderr:
+                    sys.stderr.write(result.stderr.decode(errors="replace"))
+                    sys.stderr.flush()
             log.error("Build failed.")
             raise SystemExit(1)
 
         log.success("Build completed successfully.")
 
     except FileNotFoundError as e:
-        log.error(str(e))
+        log.error(_format_missing_tool(e))
+        raise SystemExit(1)
+    except subprocess.CalledProcessError as e:
+        log.error(_format_subprocess_failure(e))
         raise SystemExit(1)
     except (ConfigError, RecipeError) as e:
         log.error(f"Configuration error: {e}")
@@ -711,33 +1020,57 @@ def clean(log: Logger, build_dir: str) -> None:
     type=click.Path(),
     help="Build output directory.",
 )
+@click.option(
+    "--backend",
+    default=None,
+    type=click.Choice(["auto", "cmake", "make", "meson", "cargo", "ninja", "kbuild"]),
+    help="Force a specific build backend.",
+)
+@click.option(
+    "--board",
+    default=None,
+    help="Target board name (e.g., stm32f4, nrf52). Recorded in the project "
+         "config so later `ebuild build` / `flash` / `monitor` use it.",
+)
 @click.pass_obj
-def configure(log: Logger, config_path: str, build_dir: str) -> None:
+def configure(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
+              board: Optional[str]) -> None:
     """Generate build files without building."""
     log.header("ebuild — Configure")
 
     try:
+        if board:
+            _record_board_selection(board, log)
+
         log.step("Loading configuration...")
         cfg = load_config(config_path)
         log.info(f"Project: {cfg.name} v{cfg.version}")
 
-        log.step("Resolving toolchain...")
-        compiler = resolve_toolchain(cfg.toolchain)
-
         build_path = Path(build_dir)
+        resolved_backend, backend_config = _resolve_backend_request(
+            cfg=cfg,
+            backend_override=backend,
+            source_dir=cfg.source_dir,
+            log=log,
+        )
 
-        package_paths = _install_packages(cfg, build_path, log, verbose=log.verbose)
+        if resolved_backend == "ninja":
+            _configure_ninja_backend(cfg, build_path, log)
+            return
 
-        log.step(f"Generating build.ninja in {build_path}/...")
-        backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
-        backend.generate()
-
-        log.success(f"Generated {build_path / 'build.ninja'}")
-        log.success(f"Generated {build_path / 'compile_commands.json'}")
-        log.info("Run 'ebuild build' to compile.")
+        _configure_external_backend(
+            cfg=cfg,
+            resolved_backend=resolved_backend,
+            backend_config=backend_config,
+            build_path=build_path,
+            log=log,
+        )
 
     except FileNotFoundError as e:
-        log.error(str(e))
+        log.error(_format_missing_tool(e))
+        raise SystemExit(1)
+    except subprocess.CalledProcessError as e:
+        log.error(_format_subprocess_failure(e))
         raise SystemExit(1)
     except (ConfigError, RecipeError) as e:
         log.error(f"Configuration error: {e}")
@@ -1468,6 +1801,11 @@ def new(log: Logger, project_name: str, template_name: str, board_name: str,
     # Create project directory structure
     src_dir = project_dir / "src"
     src_dir.mkdir(parents=True)
+    # A scaffolded project ships a runnable test so that `ebuild test`, step
+    # six of the golden path, passes on a fresh checkout instead of reporting
+    # that the project declares no tests.
+    tests_dir = project_dir / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
 
     # Template variable substitution
     replacements = {
@@ -1483,6 +1821,7 @@ def new(log: Logger, project_name: str, template_name: str, board_name: str,
     # Copy and process template files
     file_mapping = {
         "main.c.template": src_dir / "main.c",
+        "test_main.c.template": tests_dir / "test_main.c",
         "build.yaml.template": project_dir / "build.yaml",
         "eos.yaml.template": project_dir / "eos.yaml",
         "README.md.template": project_dir / "README.md",
@@ -1815,3 +2154,257 @@ def generate_board(
     except Exception as e:
         log.error(f"Board generation failed: {e}")
         raise SystemExit(1)
+
+
+@cli.command()
+@click.option(
+    "--config",
+    "config_path",
+    default="build.yaml",
+    type=click.Path(),
+    help="Path to the build configuration file.",
+)
+@click.option(
+    "--build-dir",
+    default="_build",
+    type=click.Path(),
+    help="Build output directory.",
+)
+@click.option(
+    "--filter",
+    "name_filter",
+    default=None,
+    help="Only run tests whose name contains this substring.",
+)
+@click.pass_obj
+def test(log: Logger, config_path: str, build_dir: str,
+         name_filter: Optional[str]) -> None:
+    """Build and run the project's tests.
+
+    Step six of the golden path. Delegates to whichever runner the project
+    already uses -- ctest for a CMake tree, `cargo test`, `meson test`, or
+    `make test` -- rather than imposing a test framework on the project.
+    """
+    log.header("ebuild — Test")
+
+    build_path = Path(build_dir)
+
+    try:
+        log.step("Loading configuration...")
+        cfg = load_config(config_path)
+        log.info(f"Project: {cfg.name} v{cfg.version}")
+    except FileNotFoundError:
+        log.error(
+            f"No {config_path} here. Run this from a project directory, or "
+            f"pass --config."
+        )
+        raise SystemExit(1)
+    except (ConfigError, RecipeError) as e:
+        log.error(f"Configuration error: {e}")
+        raise SystemExit(1)
+
+    native = [t for t in cfg.targets if t.target_type == "test"]
+    if native:
+        _run_native_tests(cfg, native, build_path, log, name_filter)
+        return
+
+    runner = _resolve_test_runner(cfg.source_dir, build_path, name_filter)
+    if runner is None:
+        log.error(
+            "No test runner found for this project.\n"
+            "  ebuild test drives the project's own runner. Add one of:\n"
+            "    - CMake with enable_testing() + add_test()   -> ctest\n"
+            "    - a 'test' target in the Makefile            -> make test\n"
+            "    - Cargo.toml                                 -> cargo test\n"
+            "    - meson.build                                -> meson test"
+        )
+        raise SystemExit(1)
+
+    name, argv, cwd = runner
+    log.step(f"Running tests with {name}...")
+    log.info(" ".join(argv))
+
+    try:
+        result = subprocess.run(argv, cwd=str(cwd))
+    except FileNotFoundError:
+        log.error(
+            f"{name} is not installed or not on PATH, so the tests cannot be "
+            f"run here."
+        )
+        raise SystemExit(1)
+
+    if result.returncode != 0:
+        log.error(f"Tests failed ({name} exited {result.returncode}).")
+        raise SystemExit(result.returncode)
+
+    log.success("All tests passed.")
+
+
+def _run_native_tests(
+    cfg: "ProjectConfig",
+    targets: List[Any],
+    build_path: Path,
+    log: Logger,
+    name_filter: Optional[str],
+) -> None:
+    """Build and run the project's own ``test`` targets.
+
+    A scaffolded project has no CMake tree and no Makefile, so there is no
+    external runner to delegate to. The test binaries are ordinary ebuild
+    targets; build them the same way `ebuild build` does, then run each one
+    and treat a non-zero exit as a failure.
+    """
+    selected = [t for t in targets if not name_filter or name_filter in t.name]
+    if not selected:
+        log.error(f"No test target matches --filter {name_filter!r}.")
+        raise SystemExit(1)
+
+    log.step("Building test targets...")
+    _configure_ninja_backend(cfg, build_path, log, suggest_build=False)
+
+    from ebuild.build.dispatch import ninja_command
+
+    # Ninja addresses targets by their output path, and `ebuild build` drives
+    # it with -f from the project root, so the same form is used here.
+    argv = (
+        ninja_command()
+        + ["-f", str(build_path / "build.ninja")]
+        + [str(build_path / t.name) for t in selected]
+    )
+    result = subprocess.run(argv)
+    if result.returncode != 0:
+        log.error("Test targets failed to build.")
+        raise SystemExit(result.returncode)
+
+    failures: List[str] = []
+    for target in selected:
+        binary = build_path / target.name
+        if not binary.is_file():
+            log.error(f"{target.name}: built, but no binary at {binary}")
+            failures.append(target.name)
+            continue
+
+        log.step(f"Running {target.name}...")
+        run = subprocess.run([str(binary)])
+        if run.returncode == 0:
+            log.success(f"  {target.name}: passed")
+        else:
+            log.error(f"  {target.name}: exited {run.returncode}")
+            failures.append(target.name)
+
+    if failures:
+        log.error(f"{len(failures)} of {len(selected)} test targets failed: "
+                  + ", ".join(failures))
+        raise SystemExit(1)
+
+    log.success(f"All {len(selected)} test targets passed.")
+
+
+def _resolve_test_runner(
+    source_dir: Path,
+    build_dir: Path,
+    name_filter: Optional[str],
+) -> Optional[Tuple[str, List[str], Path]]:
+    """Pick the test runner this project already uses.
+
+    Returns ``(display_name, argv, cwd)``, or None when the project declares
+    no tests. Ordered so that an explicit CMake test registry wins over a
+    generic `make test` target in the same tree.
+    """
+    if (build_dir / "CTestTestfile.cmake").is_file():
+        argv = ["ctest", "--output-on-failure"]
+        if name_filter:
+            argv += ["-R", name_filter]
+        return "ctest", argv, build_dir
+
+    if (source_dir / "Cargo.toml").is_file():
+        argv = ["cargo", "test"]
+        if name_filter:
+            argv += [name_filter]
+        return "cargo test", argv, source_dir
+
+    if (build_dir / "meson-info").is_dir():
+        argv = ["meson", "test", "-C", str(build_dir)]
+        if name_filter:
+            argv += ["--suite", name_filter]
+        return "meson test", argv, source_dir
+
+    makefile = next(
+        (source_dir / n for n in ("Makefile", "makefile", "GNUmakefile")
+         if (source_dir / n).is_file()),
+        None,
+    )
+    if makefile is not None:
+        text = makefile.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"^test\s*:", text, re.MULTILINE):
+            return "make test", ["make", "-C", str(source_dir), "test"], source_dir
+
+    return None
+
+
+@cli.command()
+@click.option("--port", default=None,
+              help="Serial device (e.g. /dev/ttyUSB0). Auto-detected if omitted.")
+@click.option("--baud", default=115200, type=int, help="Baud rate.")
+@click.pass_obj
+def monitor(log: Logger, port: Optional[str], baud: int) -> None:
+    """Attach a serial monitor to the target device.
+
+    Step eight of the golden path -- the step that shows a developer their
+    first firmware run actually produced output.
+    """
+    log.header("ebuild — Monitor")
+    log.info(f"Board: {_selected_board()}")
+
+    if port is None:
+        candidates = _serial_ports()
+        if not candidates:
+            log.error(
+                "No serial device found.\n"
+                "  Looked for /dev/ttyUSB*, /dev/ttyACM*, /dev/tty.usb*.\n"
+                "  Connect the board, or name the device with --port."
+            )
+            raise SystemExit(1)
+        if len(candidates) > 1:
+            log.error(
+                "More than one serial device is connected, so ebuild will not "
+                "guess which one is the board:\n"
+                + "\n".join(f"    {c}" for c in candidates)
+                + "\n  Choose one with --port."
+            )
+            raise SystemExit(1)
+        port = candidates[0]
+        log.info(f"Auto-detected {port}")
+
+    log.step(f"Opening {port} at {baud} baud... (Ctrl-C to exit)")
+
+    try:
+        import serial  # type: ignore[import-untyped]
+    except ImportError:
+        log.error(
+            "pyserial is not installed, so the monitor cannot open the port.\n"
+            "  Install it with:  pip install pyserial"
+        )
+        raise SystemExit(1)
+
+    try:
+        with serial.Serial(port, baud, timeout=0.2) as conn:
+            while True:
+                chunk = conn.read(4096)
+                if chunk:
+                    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+    except KeyboardInterrupt:
+        log.info("")
+        log.success("Monitor closed.")
+    except Exception as e:
+        log.error(f"Serial error on {port}: {e}")
+        raise SystemExit(1)
+
+
+def _serial_ports() -> List[str]:
+    """Serial devices that look like an attached development board."""
+    found: List[str] = []
+    for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/tty.usb*"):
+        found.extend(sorted(glob.glob(pattern)))
+    return found

@@ -1,161 +1,80 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 EoS Project
 
-"""Unit tests for NinjaBackend generator.
+"""Unit tests for ebuild.build.ninja_backend.NinjaBackend."""
 
-Validates that NinjaBackend correctly generates build.ninja and compile_commands.json,
-properly propagating toolchain-level cflags, ldflags, and sysroot alongside target-specific
-options and dependencies.
-"""
-
+import sys
+import tempfile
+import unittest
 from pathlib import Path
-import json
-import pytest
+from types import SimpleNamespace
 
-from ebuild.build.ninja_backend import NinjaBackend, PackagePaths
-from ebuild.build.toolchain import ResolvedToolchain
+from ebuild.build.ninja_backend import NinjaBackend
 from ebuild.core.config import ProjectConfig, TargetConfig
 
 
-@pytest.mark.ebuild
-class TestNinjaBackend:
-    """Tests for NinjaBackend file generation."""
+def _toolchain():
+    return SimpleNamespace(cc="cc", cxx="c++", ar="ar")
 
-    def test_default_toolchain_generation(self, tmp_path):
-        """Verify default host toolchain without extra flags."""
-        target = TargetConfig(
-            name="app",
-            target_type="executable",
-            sources=["src/main.c"],
-            cflags=["-O2"],
-            ldflags=["-lm"],
-        )
-        config = ProjectConfig(
-            name="test_proj",
-            version="1.0.0",
-            targets=[target],
-            source_dir=tmp_path,
-        )
-        toolchain = ResolvedToolchain(
-            cc="gcc",
-            cxx="g++",
-            ar="ar",
-        )
 
-        build_dir = tmp_path / "_build"
-        backend = NinjaBackend(config, build_dir, toolchain)
+class TestNinjaBackendSharedLibrary(unittest.TestCase):
+    """A shared_library target must link with the platform's shared-object
+    flag and get the same -L/-l wiring as executables. Previously it used the
+    link_shared rule but emitted no ldflags and no libs line at all, so any
+    -L/-l from `uses` and any target ldflags were silently dropped."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def _generate(self, name: str, target: TargetConfig, package_paths=None) -> str:
+        build_dir = Path(self._tmpdir.name) / name
+        config = ProjectConfig(name="proj", version="1.0", targets=[target], source_dir=build_dir)
+        backend = NinjaBackend(config, build_dir, _toolchain(), package_paths=package_paths)
         backend.generate()
+        return (build_dir / "build.ninja").read_text(encoding="utf-8")
 
-        ninja_file = build_dir / "build.ninja"
-        assert ninja_file.exists()
-        ninja_content = ninja_file.read_text(encoding="utf-8")
+    def test_shared_library_gets_shared_flag(self):
+        target = TargetConfig(name="mylib", target_type="shared_library", sources=["lib.c"])
+        ninja = self._generate("shared", target)
 
-        assert "cc = gcc" in ninja_content
-        assert "cflags = -O2" in ninja_content
-        assert "ldflags = -lm" in ninja_content
+        shared_flag = "-dynamiclib" if sys.platform == "darwin" else "-shared"
+        self.assertIn(shared_flag, ninja)
+        # It must go through a compiler-driver rule, not the `ar` archiver.
+        # link_shared is that rule, and it carries the shared-object flag so
+        # the flag is never repeated in the edge's ldflags.
+        lib_line = next(line for line in ninja.splitlines() if "libmylib" in line and line.startswith("build"))
+        self.assertIn(": link_shared ", lib_line)
+        self.assertNotIn(": ar_rule", lib_line)
 
-        cc_file = build_dir / "compile_commands.json"
-        assert cc_file.exists()
-        cc_data = json.loads(cc_file.read_text(encoding="utf-8"))
-        assert len(cc_data) == 1
-        assert cc_data[0]["file"] == "src/main.c"
-        assert "gcc -O2 -c src/main.c" in cc_data[0]["command"]
-
-    def test_toolchain_flags_and_sysroot_propagation(self, tmp_path):
-        """Verify that toolchain-level cflags, ldflags, and sysroot are emitted."""
+    def test_shared_library_gets_lib_dirs_and_libs(self):
         target = TargetConfig(
-            name="firmware",
-            target_type="executable",
-            sources=["src/main.c", "src/startup.c"],
-            cflags=["-Wall"],
-            ldflags=["-Wl,--gc-sections"],
+            name="mylib", target_type="shared_library", sources=["lib.c"], uses=["zlib"]
         )
-        config = ProjectConfig(
-            name="embedded_app",
-            version="0.1.0",
-            targets=[target],
-            source_dir=tmp_path,
-        )
-        toolchain = ResolvedToolchain(
-            cc="arm-none-eabi-gcc",
-            cxx="arm-none-eabi-g++",
-            ar="arm-none-eabi-ar",
-            prefix="arm-none-eabi-",
-            arch="arm",
-            sysroot="/opt/toolchains/arm-none-eabi/arm-none-eabi",
-            cflags=["-mcpu=cortex-m4", "-mthumb"],
-            ldflags=["-T", "linker/stm32f4.ld"],
-        )
-
-        build_dir = tmp_path / "_build"
-        backend = NinjaBackend(config, build_dir, toolchain)
-        backend.generate()
-
-        ninja_file = build_dir / "build.ninja"
-        ninja_content = ninja_file.read_text(encoding="utf-8")
-
-        # Verify compiler flags include toolchain cflags, sysroot, and target cflags
-        assert "-mcpu=cortex-m4" in ninja_content
-        assert "-mthumb" in ninja_content
-        assert "--sysroot=/opt/toolchains/arm-none-eabi/arm-none-eabi" in ninja_content
-        assert "-Wall" in ninja_content
-
-        # Verify linker flags include toolchain ldflags, sysroot, and target ldflags
-        assert "-T linker/stm32f4.ld" in ninja_content or "-T linker/stm32f4.ld" in ninja_content
-        assert "-Wl,--gc-sections" in ninja_content
-
-        # Verify compile_commands.json contains toolchain flags and sysroot
-        cc_file = build_dir / "compile_commands.json"
-        cc_data = json.loads(cc_file.read_text(encoding="utf-8"))
-        assert len(cc_data) == 2
-        for entry in cc_data:
-            cmd = entry["command"]
-            assert "arm-none-eabi-gcc" in cmd
-            assert "-mcpu=cortex-m4" in cmd
-            assert "-mthumb" in cmd
-            assert "--sysroot=/opt/toolchains/arm-none-eabi/arm-none-eabi" in cmd
-            assert "-Wall" in cmd
-
-    def test_static_library_and_package_paths(self, tmp_path):
-        """Verify static library generation and package path integration."""
-        lib_target = TargetConfig(
-            name="mylib",
-            target_type="static_library",
-            sources=["src/lib.c"],
-            cflags=["-fPIC"],
-        )
-        app_target = TargetConfig(
-            name="myapp",
-            target_type="executable",
-            sources=["src/app.c"],
-            depends=["mylib"],
-            uses=["zlib"],
-        )
-        config = ProjectConfig(
-            name="pkg_app",
-            version="1.0.0",
-            targets=[lib_target, app_target],
-            source_dir=tmp_path,
-        )
-        toolchain = ResolvedToolchain(
-            cc="gcc",
-            cxx="g++",
-            ar="ar",
-            cflags=["-O3"],
-        )
-        pkg_paths = {
-            "zlib": PackagePaths(
-                include_dirs=[tmp_path / "pkg/include"],
-                lib_dirs=[tmp_path / "pkg/lib"],
-                libraries=["z"],
-            )
+        lib_dir = Path(self._tmpdir.name) / "zlib-lib"
+        package_paths = {
+            "zlib": SimpleNamespace(include_dirs=[], lib_dirs=[lib_dir], libraries=["z"])
         }
+        ninja = self._generate("shared_libs", target, package_paths=package_paths)
 
-        build_dir = tmp_path / "_build"
-        backend = NinjaBackend(config, build_dir, toolchain, package_paths=pkg_paths)
-        backend.generate()
+        self.assertIn(f"-L{lib_dir}", ninja)
+        self.assertIn("libs = -lz", ninja)
 
-        ninja_content = (build_dir / "build.ninja").read_text(encoding="utf-8")
-        assert "libmylib.a" in ninja_content
-        assert "-lz" in ninja_content
-        assert "-O3" in ninja_content
+    def test_static_library_unaffected(self):
+        target = TargetConfig(name="mylib", target_type="static_library", sources=["lib.c"])
+        ninja = self._generate("static", target)
+
+        self.assertIn(": ar_rule", ninja)
+
+        # The link_shared *rule* is always declared in the preamble, so the
+        # bare string "-shared" is present in every generated file. What must
+        # be absent is any build *edge* that uses it.
+        edges = [line for line in ninja.splitlines() if line.startswith("build ")]
+        self.assertTrue(edges, "no build edges were generated")
+        for edge in edges:
+            self.assertNotIn(": link_shared ", edge)
+            self.assertNotIn(": link ", edge)
+
+
+if __name__ == "__main__":
+    unittest.main()

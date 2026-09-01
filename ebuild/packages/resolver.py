@@ -36,6 +36,14 @@ class PackageResolver:
     ) -> List[PackageRecipe]:
         """Resolve a list of requested packages into a full build order.
 
+        Version selection:
+            An explicitly requested version pins the package for the whole
+            resolution, no matter where in the dependency graph the package is
+            first reached. Packages requested without a version resolve to the
+            newest one in the registry. Requesting two different versions of
+            the same package is a conflict and raises rather than silently
+            selecting one of them.
+
         Args:
             requested: List of dicts with 'name' and optional 'version' keys.
 
@@ -43,15 +51,22 @@ class PackageResolver:
             List of PackageRecipe in correct build order (dependencies first).
 
         Raises:
-            ResolveError: If a package or dependency cannot be found.
+            ResolveError: If a package or dependency cannot be found, if two
+                incompatible versions of the same package are requested, or if
+                the dependency graph contains a cycle.
         """
         resolved: Dict[str, PackageRecipe] = {}
         graph = DependencyGraph()
 
+        # Collect explicit pins up front. Doing this before walking the graph
+        # is what makes the result independent of request order: otherwise the
+        # first traversal to reach a package fixes its version, and a pin
+        # appearing later in the list is swallowed by the memoization in
+        # _collect().
+        pins = self._collect_pins(requested)
+
         for pkg in requested:
-            name = pkg.get("name", "")
-            version = pkg.get("version")
-            self._collect(name, version, resolved, graph)
+            self._collect(pkg.get("name", ""), pins, resolved, graph)
 
         try:
             order = graph.topological_sort()
@@ -60,10 +75,37 @@ class PackageResolver:
 
         return [resolved[name] for name in order if name in resolved]
 
+    @staticmethod
+    def _collect_pins(requested: List[Dict[str, str]]) -> Dict[str, str]:
+        """Map package name → explicitly requested version.
+
+        Raises:
+            ResolveError: If the same package is requested at two different
+                versions.
+        """
+        pins: Dict[str, str] = {}
+
+        for pkg in requested:
+            name = pkg.get("name", "")
+            version = pkg.get("version")
+            if not version:
+                continue
+
+            existing = pins.get(name)
+            if existing is not None and existing != version:
+                raise ResolveError(
+                    f"Conflicting versions requested for package '{name}': "
+                    f"'{existing}' and '{version}'. "
+                    "Request a single version of each package."
+                )
+            pins[name] = version
+
+        return pins
+
     def _collect(
         self,
         name: str,
-        version: Optional[str],
+        pins: Dict[str, str],
         resolved: Dict[str, PackageRecipe],
         graph: DependencyGraph,
     ) -> None:
@@ -71,6 +113,7 @@ class PackageResolver:
         if name in resolved:
             return
 
+        version = pins.get(name)
         recipe = self.registry.get(name, version)
         if recipe is None:
             raise ResolveError(
@@ -84,7 +127,7 @@ class PackageResolver:
         graph.add_node(name)
 
         for dep_name in recipe.dependencies:
-            self._collect(dep_name, None, resolved, graph)
+            self._collect(dep_name, pins, resolved, graph)
             graph.add_edge(name, dep_name)
 
     def resolve_single(self, name: str, version: Optional[str] = None) -> PackageRecipe:

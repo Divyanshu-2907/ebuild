@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Ninja backend: header changes now trigger a rebuild.** The generated `cc`
+  rule declared no depfile, so Ninja only knew about the sources listed in
+  `build.yaml`. Editing a header left stale object files in place and the build
+  reported success. The rule now compiles with `-MMD -MF $out.d` and declares
+  `depfile`/`deps`, so Ninja tracks the real include graph
+  (`ebuild/build/ninja_backend.py`).
+
 ## [3.0.1] - 2026-05-16
 
 ### Production Release — Unified EmbeddedOS-org v3.0.1

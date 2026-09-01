@@ -398,9 +398,11 @@ class EosHardwareAnalyzer:
         profile.confidence = 0.6
         text = description.lower()
 
-        # Detect MCU
-        for mcu_key, props in self.MCU_DATABASE.items():
+        # Match the longest key first: some entries are prefixes of longer,
+        # more specific ones ("nrf52" of "nrf52840", "sa110" of "sa1100").
+        for mcu_key in sorted(self.MCU_DATABASE, key=len, reverse=True):
             if mcu_key in text:
+                props = self.MCU_DATABASE[mcu_key]
                 profile.mcu = mcu_key.upper()
                 profile.mcu_family = props["family"]
                 profile.arch = props["arch"]
