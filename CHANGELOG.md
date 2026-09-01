@@ -3,7 +3,21 @@
 ## [Unreleased]
 
 ### Fixed
-- **`load_config`:** `toolchain.extra_cflags` and `toolchain.extra_ldflags` must be YAML lists of strings so scalar values cannot silently split into per-character compiler flags.
+- **`ebuild.build.dispatch` was unimportable.** Two branches independently added
+  an unhandled-backend `else` clause to `BackendDispatcher.configure()`; the
+  merge kept both, leaving a second `else` after the first and a `SyntaxError`
+  that broke every command importing the module. The duplicate is removed and
+  the two clauses are consolidated into one
+  (`ebuild/build/dispatch.py`).
+- **`configure(backend="ninja")` no longer silently succeeds.** `ebuild build`
+  routes `backend: ninja` with no `targets` into the dispatcher, which has no
+  ninja configure step; the no-op let the CLI report success having built
+  nothing. It now raises with a message naming the missing `targets`
+  (`ebuild/build/dispatch.py`).
+- **Unhandled-backend errors no longer contradict themselves.** The message
+  listed `ALL_BACKENDS` as supported, which includes `ninja` — the very backend
+  being rejected. Each step now reports only the backends it handles
+  (`ebuild/build/dispatch.py`).
 - **Ninja backend: header changes now trigger a rebuild.** The generated `cc`
   rule declared no depfile, so Ninja only knew about the sources listed in
   `build.yaml`. Editing a header left stale object files in place and the build
@@ -40,6 +54,14 @@
   relative `--build-dir` now resolves against the directory containing
   `build.yaml`, as an absolute path, so both sides agree regardless of the
   working directory (`ebuild/cli/commands.py`).
+
+### Added
+- `ebuild.build.dispatch.UnknownBackendError`, raised for a backend a dispatch
+  step does not handle. It derives from both `ValueError` and `RuntimeError`
+  because the clauses it replaces raised one each and callers depend on both —
+  notably the CLI's `except RuntimeError`, which turns this into a clean
+  `exit 1` rather than a traceback. New code should catch
+  `UnknownBackendError`.
 
 ## [3.0.1] - 2026-05-16
 

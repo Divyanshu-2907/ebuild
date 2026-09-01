@@ -12,7 +12,7 @@ import pytest
 from ebuild.build.dispatch import (
     ALL_BACKENDS,
     BackendDispatcher,
-    BackendError,
+    UnknownBackendError,
     detect_backend,
 )
 
@@ -166,3 +166,68 @@ class TestCleanBackends:
         mock_sub.run.assert_called_once()
         cmd = mock_sub.run.call_args[0][0]
         assert "clean" in cmd
+
+
+# ── BackendDispatcher — unknown-backend error contract ──────
+
+
+class TestUnknownBackendError:
+    """The error raised for an unhandled backend.
+
+    ``configure()`` and ``build()`` grew two independent unhandled-backend
+    branches on separate branches; merging them left duplicated ``else``
+    clauses (a SyntaxError that made the module unimportable) raising two
+    different types. ``UnknownBackendError`` is the single type, derived
+    from both so neither caller contract broke.
+    """
+
+    def test_error_is_both_value_and_runtime_error(self, tmp_path):
+        """Callers catching either legacy type must keep working.
+
+        ``ebuild build`` funnels this through ``except RuntimeError``; the
+        older dispatcher tests catch ``ValueError``.
+        """
+        assert issubclass(UnknownBackendError, ValueError)
+        assert issubclass(UnknownBackendError, RuntimeError)
+
+        d = BackendDispatcher(tmp_path, tmp_path / "build")
+        with pytest.raises(UnknownBackendError):
+            d.build("gradle")
+
+    def test_configure_ninja_raises_instead_of_silently_passing(self, tmp_path):
+        """``backend: ninja`` with no targets reaches the dispatcher.
+
+        A silent no-op here let the CLI report "Build completed
+        successfully" with exit code 0 having built nothing.
+        """
+        d = BackendDispatcher(tmp_path, tmp_path / "build")
+        with pytest.raises(UnknownBackendError, match="ninja"):
+            d.configure("ninja")
+
+    def test_ninja_error_explains_the_targets_requirement(self, tmp_path):
+        """The message must be actionable, not just a rejection."""
+        d = BackendDispatcher(tmp_path, tmp_path / "build")
+        with pytest.raises(UnknownBackendError, match="targets"):
+            d.build("ninja")
+
+    def test_error_does_not_list_the_rejected_backend_as_supported(self, tmp_path):
+        """ALL_BACKENDS contains 'ninja', so listing it here contradicted
+        the rejection. Each step reports only what it actually handles."""
+        d = BackendDispatcher(tmp_path, tmp_path / "build")
+        with pytest.raises(UnknownBackendError) as excinfo:
+            d.configure("ninja")
+
+        supported = str(excinfo.value).split("BackendDispatcher can configure:")[1]
+        supported = supported.split(".")[0]
+        assert "ninja" not in supported
+
+    def test_clean_still_accepts_ninja(self, tmp_path):
+        """clean() genuinely handles ninja -- only configure/build do not."""
+        d = BackendDispatcher(tmp_path, tmp_path / "build")
+        d.clean("ninja", dry_run=True)  # must not raise
+
+    def test_no_configure_step_backends_stay_noops(self, tmp_path):
+        """cargo/make/kbuild are accepted-and-skipped, not errors."""
+        d = BackendDispatcher(tmp_path, tmp_path / "build")
+        for backend in ("cargo", "make", "kbuild"):
+            d.configure(backend)  # must not raise

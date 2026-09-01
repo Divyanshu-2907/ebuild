@@ -85,6 +85,48 @@ def ninja_command():
     exe = shutil.which("ninja")
     return [exe] if exe else [sys.executable, "-m", "ninja"]
 
+#: Backends ``BackendDispatcher`` accepts, per step. ``ninja`` is absent from
+#: configure/build on purpose: ebuild's own Ninja backend is driven directly by
+#: the CLI (see ``NinjaBackend``), never through this dispatcher. ``clean``
+#: still accepts it because removing a stale ``_build/`` needs no toolchain.
+CONFIGURE_BACKENDS = {"cmake", "meson", "cargo", "make", "kbuild"}
+
+BUILD_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild"}
+
+CLEAN_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild", "ninja"}
+
+
+class UnknownBackendError(ValueError, RuntimeError):
+    """Raised when a backend name is not handled by ``BackendDispatcher``.
+
+    Inherits from both :class:`ValueError` and :class:`RuntimeError` because
+    the two behaviours this consolidates were introduced independently and
+    both are depended on: callers (and the CLI's ``except RuntimeError``
+    handler, which turns this into a clean ``exit 1`` instead of a traceback)
+    may catch either. New code should catch ``UnknownBackendError``.
+    """
+
+
+def _unknown_backend(backend: str, action: str, supported: set) -> UnknownBackendError:
+    """Build the error raised for a backend a step cannot handle.
+
+    Args:
+        backend: The rejected backend name.
+        action: Verb phrase naming the step, e.g. ``"configure"``.
+        supported: Backend names the step does accept.
+    """
+    message = (
+        f"Unknown build backend '{backend}'. "
+        f"BackendDispatcher can {action}: {', '.join(sorted(supported))}."
+    )
+    if backend == "ninja":
+        message += (
+            " ebuild's own ninja backend is invoked directly rather than "
+            "through BackendDispatcher, and requires 'targets' in build.yaml "
+            "-- add targets or choose another backend."
+        )
+    return UnknownBackendError(message)
+
 
 def detect_backend(source_dir: Path) -> str:
     """Auto-detect the build system from project files.
@@ -160,7 +202,7 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            BackendError: If the backend cannot be configured here.
+            UnknownBackendError: If this step does not handle the backend.
         """
         _validate_backend(backend, SUPPORTED_BACKENDS)
         config = config or {}
@@ -179,11 +221,11 @@ class BackendDispatcher:
             cmd = ["meson", "setup", str(self.build_dir), str(self.source_dir)]
             _run_or_log(cmd, dry_run)
 
-        elif backend == "cargo":
-            pass  # Cargo does not have a separate configure step
+        elif backend in ("cargo", "make", "kbuild"):
+            pass  # These backends have no separate configure step.
 
-        elif backend in ("make", "kbuild"):
-            pass  # No separate configure step
+        else:
+            raise _unknown_backend(backend, "configure", CONFIGURE_BACKENDS)
 
     def build(
         self,
@@ -200,7 +242,7 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            BackendError: If the backend cannot be built here.
+            UnknownBackendError: If this step does not handle the backend.
         """
         _validate_backend(backend, SUPPORTED_BACKENDS)
         config = config or {}
@@ -231,6 +273,9 @@ class BackendDispatcher:
             cmd = ["make", "-C", str(self.source_dir)]
             _run_or_log(cmd, dry_run)
 
+        else:
+            raise _unknown_backend(backend, "build", BUILD_BACKENDS)
+
     def clean(
         self,
         backend: str,
@@ -244,7 +289,7 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            BackendError: If the backend cannot be cleaned here.
+            UnknownBackendError: If this step does not handle the backend.
         """
         _validate_backend(backend, ALL_BACKENDS)
         if backend == "cmake":
@@ -278,3 +323,5 @@ class BackendDispatcher:
                 dry_run,
                 check=False,
             )
+        else:
+            raise _unknown_backend(backend, "clean", CLEAN_BACKENDS)
