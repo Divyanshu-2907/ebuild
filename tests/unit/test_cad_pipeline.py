@@ -56,6 +56,10 @@ def test_pipeline_generates_every_artifact(tmp_path):
         produced = tmp_path / name
         assert produced.is_file(), f"{name} not generated"
         assert produced.stat().st_size > 0, f"{name} is empty"
+        # The parser reads UTF-8; the writer must produce it. Without an
+        # explicit encoding, open() uses the platform default and these came
+        # out cp1252 on Windows.
+        produced.read_text(encoding="utf-8")
 
 
 def test_every_cpu_attribute_is_parsed_not_defaulted():

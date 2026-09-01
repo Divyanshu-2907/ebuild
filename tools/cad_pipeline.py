@@ -498,7 +498,11 @@ def main():
 
     for filename, content in artifacts.items():
         out_path = os.path.join(output_dir, filename)
-        with open(out_path, "w") as f:
+        # encoding="utf-8" to match the read side. The generated banners carry
+        # em dashes and box-drawing characters, and open() without an encoding
+        # uses the platform default -- cp1252 on Windows -- so the artifacts
+        # came out mangled there while the parser had always read UTF-8.
+        with open(out_path, "w", encoding="utf-8") as f:
             f.write(content)
         print(f"[ebuild cad_pipeline] Generated: {out_path}")
 
@@ -522,7 +526,7 @@ def main():
         "generated_artifacts": list(artifacts.keys()),
     }
     manifest_path = os.path.join(output_dir, "board_manifest.json")
-    with open(manifest_path, "w") as f:
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"[ebuild cad_pipeline] Manifest: {manifest_path}")
     print(f"[ebuild cad_pipeline] Done. {len(artifacts)+1} files written to {output_dir}/")
