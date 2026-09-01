@@ -19,6 +19,9 @@ from ebuild.packages.recipe import PackageRecipe, RecipeError, load_recipe
 # ("3.6.0-rc1") or build metadata ("1.3.1+patch2").
 _SUFFIX_SPLIT = re.compile(r"[-+]")
 
+# digits then letters: the 1.2.11b patch-respin form.
+_RESPIN = re.compile(r"(\d+)([A-Za-z]+)")
+
 _ComponentKey = Tuple[int, int, str]
 
 
@@ -29,9 +32,19 @@ def _component_key(component: str) -> _ComponentKey:
     1.9.0. Anything else compares as text and ranks below any numeric
     component, which keeps the ordering total without inventing a meaning
     for identifiers the recipe format does not define.
+
+    A component that is digits followed by letters -- the patch-respin form
+    zlib and OpenSSL use, 1.2.11b after 1.2.11 -- keeps the numeric rank of
+    its digits and orders on the letters after it, so 1.2.11 < 1.2.11b and
+    1.2.11b < 1.2.11c. Treating it as text instead put it below every
+    numeric component, which sorted the respin *below* the release it
+    supersedes.
     """
     if component.isdigit():
         return (1, int(component), "")
+    respin = _RESPIN.fullmatch(component)
+    if respin:
+        return (1, int(respin.group(1)), respin.group(2))
     return (0, 0, component)
 
 

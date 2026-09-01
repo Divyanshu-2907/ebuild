@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ebuild.packages.registry import PackageRegistry, version_key
+from ebuild.packages.registry import PackageRegistry, version_sort_key
 
 
 def _recipe(name: str, version: str):
@@ -31,7 +31,7 @@ class TestVersionKey:
     def test_numeric_versions_compare_numerically(self):
         """Plain string ordering would put 11.1.0 below 2.9.3."""
         versions = ["2.9.3", "11.1.0", "1.3.1"]
-        assert sorted(versions, key=version_key) == ["1.3.1", "2.9.3", "11.1.0"]
+        assert sorted(versions, key=version_sort_key) == ["1.3.1", "2.9.3", "11.1.0"]
 
     @pytest.mark.parametrize(
         "version",
@@ -40,18 +40,27 @@ class TestVersionKey:
     )
     def test_non_numeric_versions_do_not_raise(self, version):
         """Any of these previously raised ValueError from int()."""
-        assert version_key(version)
+        assert version_sort_key(version)
 
     def test_pre_release_sorts_below_its_release(self):
         """Semver precedence: 3.6.0-rc1 comes before 3.6.0."""
-        assert version_key("3.6.0-rc1") < version_key("3.6.0")
+        assert version_sort_key("3.6.0-rc1") < version_sort_key("3.6.0")
 
     def test_letter_suffix_sorts_above_its_base(self):
         """A patch respin such as 1.2.11b supersedes 1.2.11."""
-        assert version_key("1.2.11") < version_key("1.2.11b")
+        assert version_sort_key("1.2.11") < version_sort_key("1.2.11b")
+
+    def test_successive_respins_order_among_themselves(self):
+        """1.2.11b supersedes 1.2.11a, and both supersede 1.2.11."""
+        assert version_sort_key("1.2.11a") < version_sort_key("1.2.11b")
+        assert version_sort_key("1.2.11") < version_sort_key("1.2.11a")
+
+    def test_respin_still_ranks_above_a_textual_component(self):
+        """A respin keeps its numeric rank, so it beats a non-numeric one."""
+        assert version_sort_key("1.2.beta") < version_sort_key("1.2.11b")
 
     def test_shorter_version_sorts_below_longer(self):
-        assert version_key("1.2") < version_key("1.2.1")
+        assert version_sort_key("1.2") < version_sort_key("1.2.1")
 
 
 class TestRegistryVersionSelection:
