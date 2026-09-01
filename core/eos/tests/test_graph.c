@@ -52,7 +52,46 @@ static void test_graph_add_nodes(void) {
 
     ASSERT(g.node_count == 3, "graph has 3 nodes");
 }
+static void test_graph_max_length_node_name(void) {
+    printf("test_graph_max_length_node_name:\n");
 
+    EosGraph g;
+    eos_graph_init(&g);
+
+    char name[EOS_MAX_NAME];
+
+    /* Create a name that fills the buffer except for the null terminator. */
+    memset(name, 'A', EOS_MAX_NAME - 1);
+    name[EOS_MAX_NAME - 1] = '\0';
+
+    /*
+     * Fill the destination with non-zero data so the test can detect
+     * a missing null terminator even though eos_graph_init() zeroes
+     * the graph initially.
+     */
+    memset(g.nodes[0].name, 'X', EOS_MAX_NAME);
+
+    int id;
+    EosResult r = eos_graph_add_node(
+        &g,
+        name,
+        EOS_NODE_PACKAGE,
+        EOS_BUILD_CMAKE,
+        &id
+    );
+
+    ASSERT(r == EOS_OK, "maximum-length node name can be added");
+
+    ASSERT(
+        g.nodes[id].name[EOS_MAX_NAME - 1] == '\0',
+        "node name is null terminated"
+    );
+
+    ASSERT(
+        eos_graph_find_node(&g, name) == id,
+        "maximum-length node name can be found"
+    );
+}
 static void test_graph_find_node(void) {
     printf("test_graph_find_node:\n");
     EosGraph g;
@@ -168,6 +207,7 @@ int main(void) {
     test_graph_init();
     test_graph_add_nodes();
     test_graph_find_node();
+    test_graph_max_length_node_name();
     test_topological_sort_linear();
     test_topological_sort_diamond();
     test_cycle_detection();
