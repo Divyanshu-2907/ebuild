@@ -166,21 +166,8 @@ def _parse_target(raw: Any) -> TargetConfig:
 
 def _parse_toolchain(raw: Dict[str, Any]) -> ToolchainConfig:
     """Parse toolchain section into a ToolchainConfig."""
-    extra_cflags = raw.get("extra_cflags", [])
-    extra_ldflags = raw.get("extra_ldflags", [])
-
-    for field_name, value in (
-        ("extra_cflags", extra_cflags),
-        ("extra_ldflags", extra_ldflags),
-    ):
-        if not isinstance(value, list):
-            raise ConfigError(
-                f"Toolchain field '{field_name}' must be a list."
-            )
-        if not all(isinstance(item, str) for item in value):
-            raise ConfigError(
-                f"Toolchain field '{field_name}' must contain only strings."
-            )
+    extra_cflags = _parse_toolchain_flag_list(raw, "extra_cflags")
+    extra_ldflags = _parse_toolchain_flag_list(raw, "extra_ldflags")
 
     return ToolchainConfig(
         compiler=raw.get("compiler", "gcc"),
@@ -190,6 +177,22 @@ def _parse_toolchain(raw: Dict[str, Any]) -> ToolchainConfig:
         extra_cflags=extra_cflags,
         extra_ldflags=extra_ldflags,
     )
+
+
+def _parse_toolchain_flag_list(
+    raw: Dict[str, Any], field_name: str
+) -> List[str]:
+    """Parse a toolchain flag list field."""
+    value = raw.get(field_name, [])
+    label = f"toolchain.{field_name}"
+
+    if not isinstance(value, list):
+        raise ConfigError(f"'{label}' must be a list.")
+
+    if not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"'{label}' must contain only strings.")
+
+    return list(value)
 
 
 def load_config(config_path: str | Path) -> ProjectConfig:
@@ -338,5 +341,4 @@ def load_config(config_path: str | Path) -> ProjectConfig:
         source_dir=config_path.parent,
         backend=backend,
         backend_config=backend_config,
-        system_config=system_config,
     )
