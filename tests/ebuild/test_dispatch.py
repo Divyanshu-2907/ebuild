@@ -12,6 +12,7 @@ import pytest
 from ebuild.build.dispatch import (
     ALL_BACKENDS,
     BackendDispatcher,
+    BackendError,
     detect_backend,
 )
 
@@ -65,25 +66,21 @@ class TestDetectBackend:
 
 
 class TestUnknownBackend:
-    """Unknown backends must raise rather than silently skip.
-
-    All three methods raise RuntimeError for this one condition, so a caller
-    can guard the whole dispatcher with a single ``except RuntimeError``.
-    """
+    """Unknown backends must raise BackendError rather than silently skip."""
 
     def test_configure_unknown_raises(self, tmp_path):
         d = BackendDispatcher(tmp_path, tmp_path / "build")
-        with pytest.raises(RuntimeError, match="bazel"):
+        with pytest.raises(BackendError, match="Unknown build backend 'bazel'"):
             d.configure("bazel")
 
     def test_build_unknown_raises(self, tmp_path):
         d = BackendDispatcher(tmp_path, tmp_path / "build")
-        with pytest.raises(RuntimeError, match="gradle"):
+        with pytest.raises(BackendError, match="Unknown build backend"):
             d.build("gradle")
 
     def test_clean_unknown_raises(self, tmp_path):
         d = BackendDispatcher(tmp_path, tmp_path / "build")
-        with pytest.raises(RuntimeError, match="Unknown build backend"):
+        with pytest.raises(BackendError, match="Unknown build backend"):
             d.clean("scons")
 
 

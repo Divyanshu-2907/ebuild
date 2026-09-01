@@ -52,6 +52,10 @@ jobs:
         run: ruff check . --select=E,F,W --ignore=E501
         continue-on-error: true
 
+      # --exclude: layers/eosuite/ vendors its own tests/ package, so a bare
+      # `mypy .` sees two modules named "tests" and bails with "Duplicate
+      # module named 'tests'" before checking anything. continue-on-error hid
+      # that the type check was doing no work at all.
       - name: Type check (mypy)
         # --exclude: layers/eosuite/ vendors its own tests/ package, so a bare
         # `mypy .` sees two modules named "tests" and bails with "Duplicate

@@ -31,12 +31,23 @@ _PIC_FLAGS = {"-fPIC", "-fpic", "-fPIE", "-fpie", "-fno-pic", "-fno-PIC",
               "-fno-pie", "-fno-PIE"}
 
 
-def _shared_flag() -> str:
-    """The compiler flag that produces a shared object on this platform.
+def _ninja_path(path) -> str:
+    """Escape *path* for use in a Ninja build statement.
 
-    macOS links dynamic libraries with -dynamiclib; ELF platforms use -shared.
+    Ninja splits build statements on unescaped spaces and colons, so a Windows
+    absolute path writes a drive letter that Ninja reads as the output/rule
+    separator:
+
+        build C:\\...\\main.o: cc main.c
+              ^ "expected build command name"
+
+    `$` is escaped first so the escapes introduced below are not re-escaped.
+    Only build statements need this; variable values (cflags, ldflags) are read
+    to end of line and must not be escaped, or the flags reach the compiler
+    mangled.
     """
-    return "-dynamiclib" if sys.platform == "darwin" else "-shared"
+    text = str(path)
+    return text.replace("$", "$$").replace(":", "$:").replace(" ", "$ ")
 
 
 def _ninja_path(path) -> str:
@@ -133,19 +144,20 @@ class NinjaBackend:
         return cflags
 
     def _object_path(self, target, src: str) -> Path:
-        """Object file for one source within one target.
+        """Object file path for *src* as compiled by *target*.
 
-        Namespaced by target name: a source shared by two targets must produce
-        two distinct objects. Ninja rejects two edges writing the same output,
-        and the targets may compile it with different cflags.
+        Object paths are namespaced by target name. Two targets may legitimately
+        list the same source: a library and a test binary sharing a helper, or
+        one source built twice with different defines. Each needs its own
+        object, because each compiles with its own cflags. Keying only on the
+        source made both targets claim one output, which ninja rejects with
+        "multiple rules generate ...".
 
-        The source's directory structure is flattened into the filename rather
-        than mirrored beneath the build directory. Mirroring lets a source from
-        outside the project -- ``../shared/util.c`` -- place its object outside
-        the build directory too, where ``clean`` will not find it.
+        Example:
+            >>> backend._object_path(target, "src/main.c")   # target.name == "app"
+            PosixPath('_build/obj/app/src/main.o')
         """
-        flat = re.sub(r"[^A-Za-z0-9_.-]", "_", str(src).replace("\\", "/"))
-        return self.build_dir / "obj" / target.name / f"{flat}.o"
+        return (self.build_dir / "obj" / target.name / src).with_suffix(".o")
 
     def _write_ninja(self) -> None:
         """Write the build.ninja file."""
@@ -165,10 +177,6 @@ class NinjaBackend:
             "rule link",
             "  command = $cc $ldflags $in -o $out $libs",
             "  description = LINK $out",
-            "",
-            "rule link_shared",
-            f"  command = $cc {_shared_flag()} $ldflags $in -o $out $libs",
-            "  description = LINK_SHARED $out",
             "",
             "rule ar_rule",
             "  command = $ar rcs $out $in",

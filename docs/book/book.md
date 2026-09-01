@@ -942,6 +942,23 @@ Request: freertos >= 10.5, mbedtls ^3.0
 +-------------------+
 ```
 
+#### Version ordering
+
+A request without a version resolves to the highest version of that package in
+the registry. `version` is a free-form string — the recipe format does not
+require dotted integers — so the ordering is defined as follows:
+
+| Rule | Example |
+|---|---|
+| A leading `v` or `V` is ignored | `v2.9.3` ranks with `2.9.3` |
+| All-digit components compare numerically | `1.10.0` > `1.9.0` |
+| Any other component compares as text, below any numeric one | `1.x` < `1.0` |
+| A `-` or `+` suffix ranks below the same version without one | `3.6.0-rc1` < `3.6.0` |
+
+Every version string has a place in this order, including ones that carry no
+numbers at all (`main`), so one unusual recipe cannot break lookup for the
+packages around it.
+
 ---
 
 ## Chapter 13: SDK Generation
