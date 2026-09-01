@@ -102,6 +102,7 @@ class ProjectConfig:
     source_dir: Path = field(default_factory=lambda: Path("."))
     backend: str = "auto"
     backend_config: Dict[str, Any] = field(default_factory=dict)
+    system_config: Dict[str, Any] = field(default_factory=dict)
 
     def get_target(self, name: str) -> Optional[TargetConfig]:
         for t in self.targets:
@@ -165,14 +166,33 @@ def _parse_target(raw: Any) -> TargetConfig:
 
 def _parse_toolchain(raw: Dict[str, Any]) -> ToolchainConfig:
     """Parse toolchain section into a ToolchainConfig."""
+    extra_cflags = _parse_toolchain_flag_list(raw, "extra_cflags")
+    extra_ldflags = _parse_toolchain_flag_list(raw, "extra_ldflags")
+
     return ToolchainConfig(
         compiler=raw.get("compiler", "gcc"),
         arch=raw.get("arch", "x86_64"),
         prefix=raw.get("prefix"),
         sysroot=raw.get("sysroot"),
-        extra_cflags=raw.get("extra_cflags", []),
-        extra_ldflags=raw.get("extra_ldflags", []),
+        extra_cflags=extra_cflags,
+        extra_ldflags=extra_ldflags,
     )
+
+
+def _parse_toolchain_flag_list(
+    raw: Dict[str, Any], field_name: str
+) -> List[str]:
+    """Parse a toolchain flag list field."""
+    value = raw.get(field_name, [])
+    label = f"toolchain.{field_name}"
+
+    if not isinstance(value, list):
+        raise ConfigError(f"'{label}' must be a list.")
+
+    if not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"'{label}' must contain only strings.")
+
+    return list(value)
 
 
 def load_config(config_path: str | Path) -> ProjectConfig:
@@ -229,13 +249,16 @@ def load_config(config_path: str | Path) -> ProjectConfig:
 
     if not isinstance(backend_config, dict):
         raise ConfigError("'backend_config' must be a mapping.")
+    backend_config = dict(backend_config)
 
-    # For system builds, pull from 'system' section
-    if raw.get("system") and isinstance(raw["system"], dict):
-        backend_config.update(raw["system"])
-
-        if backend == "auto":
-            backend = "system"
+    # System-image settings are not a compilation backend. Keep them separate
+    # so normal backend selection can still auto-detect CMake, Ninja, etc.
+    system_config = raw.get("system", {})
+    if system_config is None:
+        system_config = {}
+    if not isinstance(system_config, dict):
+        raise ConfigError("'system' must be a mapping.")
+    system_config = dict(system_config)
 
     # For cmake/make/meson builds, pull defines from config
     if raw.get("cmake") and isinstance(raw["cmake"], dict):
@@ -289,18 +312,25 @@ def load_config(config_path: str | Path) -> ProjectConfig:
 
     # --- packages section (optional, Phase 2) ---
     packages: List[PackageDep] = []
-    raw_packages = raw.get("packages", [])
-
-    if isinstance(raw_packages, list):
-        for p in raw_packages:
-            if isinstance(p, dict):
-                pkg_name = p.get("name", "")
-                pkg_version = p.get("version")
-
-                if pkg_name:
-                    packages.append(
-                        PackageDep(name=pkg_name, version=pkg_version)
-                    )
+    if "packages" in raw:
+        raw_packages = raw["packages"]
+        if not isinstance(raw_packages, list):
+            raise ConfigError(
+                "'packages' must be a list of package definitions."
+            )
+        for pkg in raw_packages:
+            if not isinstance(pkg, dict):
+                raise ConfigError(
+                    "Invalid package definition: expected a YAML mapping, "
+                    f"got {type(pkg).__name__}."
+                )
+            pkg_name = pkg.get("name", "")
+            pkg_version = pkg.get("version")
+            if not pkg_name:
+                raise ConfigError("Package definition must have a 'name' field.")
+            if pkg_version is not None and not isinstance(pkg_version, str):
+                pkg_version = str(pkg_version)
+            packages.append(PackageDep(name=pkg_name, version=pkg_version))
 
     return ProjectConfig(
         name=project_name,

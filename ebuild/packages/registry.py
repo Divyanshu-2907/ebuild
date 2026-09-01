@@ -9,10 +9,63 @@ package name and version.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ebuild.packages.recipe import PackageRecipe, RecipeError, load_recipe
+
+# Everything from the first '-' or '+' is a suffix: a pre-release tag
+# ("3.6.0-rc1") or build metadata ("1.3.1+patch2").
+_SUFFIX_SPLIT = re.compile(r"[-+]")
+
+_ComponentKey = Tuple[int, int, str]
+
+
+def _component_key(component: str) -> _ComponentKey:
+    """Order one dot-separated component of a version string.
+
+    Numeric components compare numerically, so 1.10.0 still sorts above
+    1.9.0. Anything else compares as text and ranks below any numeric
+    component, which keeps the ordering total without inventing a meaning
+    for identifiers the recipe format does not define.
+    """
+    if component.isdigit():
+        return (1, int(component), "")
+    return (0, 0, component)
+
+
+def version_sort_key(version: str) -> tuple:
+    """Sort key for a package version string.
+
+    ``PackageRecipe.validate()`` accepts any non-empty version, and real
+    embedded recipes use more than dotted integers: a leading ``v``
+    (``v2.9.3``, littlefs's own tag format), pre-release tags
+    (``3.6.0-rc1``) and build metadata (``1.3.1+patch2``). Ordering used to
+    be ``[int(x) for x in version.split('.')]``, which raised ValueError on
+    every one of them -- and did so from ``get()``, ``list_packages()`` and
+    ``list_all_versions()``, so a single such recipe anywhere in the
+    registry took down package lookup for the whole project.
+
+    Ordering rules:
+      * an optional leading ``v`` or ``V`` is ignored;
+      * the release part is compared component by component, numerically
+        where a component is all digits;
+      * a version carrying a pre-release or build suffix sorts below the
+        otherwise-equal version without one, so 3.6.0-rc1 < 3.6.0;
+      * nothing raises -- any string has a place in the order.
+    """
+    text = version.strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+
+    parts = _SUFFIX_SPLIT.split(text, maxsplit=1)
+    release = tuple(_component_key(c) for c in parts[0].split("."))
+
+    if len(parts) == 1:
+        return (release, 1, ())
+    suffix = tuple(_component_key(c) for c in re.split(r"[.\-+]", parts[1]))
+    return (release, 0, suffix)
 
 
 def _version_sort_key(version: str) -> tuple:

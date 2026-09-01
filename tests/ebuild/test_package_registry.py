@@ -13,6 +13,13 @@ def make_recipe(version: str) -> PackageRecipe:
     )
 
 
+def registry_with(*versions: str) -> PackageRegistry:
+    registry = PackageRegistry()
+    for version in versions:
+        registry._register(make_recipe(version))
+    return registry
+
+
 def test_list_all_versions_uses_numeric_version_order():
     registry = PackageRegistry()
 
