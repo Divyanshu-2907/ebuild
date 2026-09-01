@@ -1,0 +1,41 @@
+(kicad_pcb (version 20221018) (generator eos_reference)
+
+  (title_block
+    (title "EoS Reference Board")
+    (rev "1.0")
+    (company "EmbeddedOS Foundation")
+  )
+
+  ;; ── EoS memory map: (eos_mmap "NAME" "0xBASE" "0xSIZE" "FLAGS") ───────────
+  (eos_mmap "FLASH_NOR"   "0x00000000" "0x04000000" "rx")
+  (eos_mmap "RAM_LPDDR4"  "0x40000000" "0x20000000" "rwx")
+  (eos_mmap "HEAP_REGION" "0x60000000" "0x08000000" "rw")
+  (eos_mmap "OTA_SCRATCH" "0x68000000" "0x04000000" "rw")
+  (eos_mmap "UART0_PL011" "0x09000000" "0x00001000" "rw")
+
+  ;; ── CPU ──────────────────────────────────────────────────────────────────
+  (eos_cpu
+    (arch "aarch64")
+    (core "cortex-a57")
+    (freq_mhz 1000)
+    (endian "little")
+    (fpu "neon-fp-armv8")
+    (stack_size "0x10000")
+    (entry_symbol "eos_kernel_entry")
+    (boot_symbol "_start")
+  )
+
+  ;; ── Peripherals ──────────────────────────────────────────────────────────
+  (eos_peripheral
+    (name "uart0")
+    (compatible "arm,pl011")
+    (base "0x09000000")
+    (irq 33)
+  )
+  (eos_peripheral
+    (name "rtc0")
+    (compatible "arm,pl031")
+    (base "0x09010000")
+    (irq 34)
+  )
+)
