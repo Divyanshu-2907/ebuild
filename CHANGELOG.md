@@ -28,6 +28,18 @@
   0. When the backend was auto-detected and targets are declared, the ninja
   backend is now used and the choice is logged. An explicit `backend:` in
   `build.yaml` or `--backend` still takes precedence (`ebuild/cli/commands.py`).
+- **A relative `--build-dir` is now anchored to the project.** ebuild created
+  and reported the build directory relative to the process working directory,
+  while the ninja it launched read the same relative path from
+  `cfg.source_dir`. The two agree only when the working directory is the
+  project directory, so `ebuild build --config sub/build.yaml` failed with
+  "ninja: error: loading '_build/build.ninja': No such file or directory" one
+  line after reporting that it generated that file, and `ebuild configure`
+  reported success having written it where a later build would not look. A
+  relative `--build-dir` now resolves against the directory containing
+  `build.yaml`, as an absolute path, so both sides agree regardless of the
+  working directory (`ebuild/cli/commands.py`).
+
 ## [3.0.1] - 2026-05-16
 
 ### Production Release — Unified EmbeddedOS-org v3.0.1

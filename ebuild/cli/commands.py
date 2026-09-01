@@ -298,6 +298,53 @@ def _detect_libraries(lib_dir: Path, pkg_name: str) -> List[str]:
     return libs if libs else [pkg_name]
 
 
+def _resolve_build_dir(build_dir: str, cfg: ProjectConfig) -> Path:
+    """Anchor a relative ``--build-dir`` to the project, not the cwd.
+
+    ``build.yaml`` describes the project, so ``_build`` means "beside
+    build.yaml" -- which is what the committed examples show
+    (``examples/hello_world/_build/``), what README and demo.md walk
+    through, and what the generated files already assume: ninja is invoked
+    with ``cwd=cfg.source_dir``, and compile_commands.json records
+    ``directory`` as the source directory with build-dir-relative outputs.
+
+    Only the Python side disagreed. It created and reported the build
+    directory relative to the *process* cwd, so the two bases coincided
+    exactly when the cwd was the project directory -- the documented golden
+    path, and the only case the examples exercise. With ``--config`` naming
+    a project elsewhere they diverged: `build` wrote build.ninja where the
+    ninja it then launched could not open it, and `configure` reported
+    success having written it somewhere a later build would not look.
+
+    The result is absolute. A path relative to the project would still be
+    re-interpreted by ninja, which runs in ``cfg.source_dir``: a relative
+    ``--config myproj/build.yaml`` yields ``myproj/_build``, and ninja
+    would then look for ``myproj/myproj/_build/build.ninja``. Absolute is
+    the only form that means the same thing to the process creating the
+    directory and to the ninja that reads what was written into it, and it
+    keeps the generated build.ninja independent of the cwd it was
+    generated from.
+    """
+    path = Path(build_dir)
+    if not path.is_absolute():
+        path = cfg.source_dir / path
+    return path.resolve()
+
+
+def _shown(path: Path) -> str:
+    """*path* as the user would type it: relative to the cwd when it is under it.
+
+    Build directories are resolved to absolute paths so that ninja and the
+    process agree on them, but printing an absolute path for the ordinary
+    in-project build would replace the "_build/build.ninja" that demo.md
+    documents with a machine-specific one.
+    """
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
+
+
 def _resolve_backend_request(
     cfg: ProjectConfig,
     backend_override: Optional[str],
@@ -360,12 +407,12 @@ def _configure_ninja_backend(
     package_paths = {**_workspace_repo_paths(),
                      **_install_packages(cfg, build_path, log, verbose=log.verbose)}
 
-    log.step(f"Generating build.ninja in {build_path}/...")
+    log.step(f"Generating build.ninja in {_shown(build_path)}/...")
     ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
     ninja_backend.generate()
 
-    log.success(f"Generated {build_path / 'build.ninja'}")
-    log.success(f"Generated {build_path / 'compile_commands.json'}")
+    log.success(f"Generated {_shown(build_path / 'build.ninja')}")
+    log.success(f"Generated {_shown(build_path / 'compile_commands.json')}")
     if suggest_build:
         log.info("Run 'ebuild build' to compile.")
 
@@ -812,7 +859,7 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         cfg = load_config(config_path)
         log.info(f"Project: {cfg.name} v{cfg.version}")
 
-        build_path = Path(build_dir)
+        build_path = _resolve_build_dir(build_dir, cfg)
         resolved_backend, backend_config = _resolve_backend_request(
             cfg=cfg,
             backend_override=backend,
@@ -862,11 +909,11 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         package_paths = {**_workspace_repo_paths(),
                          **_install_packages(cfg, build_path, log, verbose=log.verbose, jobs=jobs)}
 
-        log.step(f"Generating build.ninja in {build_path}/...")
+        log.step(f"Generating build.ninja in {_shown(build_path)}/...")
         ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
         ninja_backend.generate()
-        log.success(f"Generated {build_path / 'build.ninja'}")
-        log.success(f"Generated {build_path / 'compile_commands.json'}")
+        log.success(f"Generated {_shown(build_path / 'build.ninja')}")
+        log.success(f"Generated {_shown(build_path / 'compile_commands.json')}")
 
         log.step("Invoking ninja...")
         from ebuild.build.dispatch import ninja_command
@@ -1068,7 +1115,7 @@ def configure(log: Logger, config_path: str, build_dir: str, backend: Optional[s
         cfg = load_config(config_path)
         log.info(f"Project: {cfg.name} v{cfg.version}")
 
-        build_path = Path(build_dir)
+        build_path = _resolve_build_dir(build_dir, cfg)
         resolved_backend, backend_config = _resolve_backend_request(
             cfg=cfg,
             backend_override=backend,
@@ -1190,7 +1237,7 @@ def install(log: Logger, config_path: str, build_dir: str) -> None:
             log.info("No packages declared in build.yaml.")
             return
 
-        build_path = Path(build_dir)
+        build_path = _resolve_build_dir(build_dir, cfg)
         _install_packages(cfg, build_path, log, verbose=log.verbose)
         log.success("All packages installed successfully.")
 
@@ -2209,8 +2256,6 @@ def test(log: Logger, config_path: str, build_dir: str,
     """
     log.header("ebuild — Test")
 
-    build_path = Path(build_dir)
-
     try:
         log.step("Loading configuration...")
         cfg = load_config(config_path)
@@ -2224,6 +2269,8 @@ def test(log: Logger, config_path: str, build_dir: str,
     except (ConfigError, RecipeError) as e:
         log.error(f"Configuration error: {e}")
         raise SystemExit(1)
+
+    build_path = _resolve_build_dir(build_dir, cfg)
 
     native = [t for t in cfg.targets if t.target_type == "test"]
     if native:
@@ -2293,7 +2340,9 @@ def _run_native_tests(
         + ["-f", str(build_path / "build.ninja")]
         + [str(build_path / t.name) for t in selected]
     )
-    result = subprocess.run(argv)
+    # Run from the project directory, as `ebuild build` does: the source
+    # paths recorded in build.ninja are relative to it.
+    result = subprocess.run(argv, cwd=str(cfg.source_dir))
     if result.returncode != 0:
         log.error("Test targets failed to build.")
         raise SystemExit(result.returncode)
