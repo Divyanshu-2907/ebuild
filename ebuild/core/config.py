@@ -42,7 +42,12 @@ class PackageDep:
 
 @dataclass
 class TargetConfig:
-    """A single build target (executable, static_library, or shared_library)."""
+    """A single build target.
+
+    A ``test`` target links exactly like an ``executable``; the type exists so
+    ``ebuild test`` can tell which binaries it is meant to run without
+    guessing from the target's name.
+    """
 
     name: str
     target_type: str
@@ -54,7 +59,10 @@ class TargetConfig:
     depends: List[str] = field(default_factory=list)
     uses: List[str] = field(default_factory=list)
 
-    VALID_TYPES = ("executable", "static_library", "shared_library")
+    VALID_TYPES = ("executable", "test", "static_library", "shared_library")
+
+    #: Target types that produce a runnable binary rather than an archive.
+    EXECUTABLE_TYPES = ("executable", "test")
 
     def validate(self) -> None:
         if not self.name:
@@ -158,13 +166,29 @@ def _parse_target(raw: Any) -> TargetConfig:
 
 def _parse_toolchain(raw: Dict[str, Any]) -> ToolchainConfig:
     """Parse toolchain section into a ToolchainConfig."""
+    extra_cflags = raw.get("extra_cflags", [])
+    extra_ldflags = raw.get("extra_ldflags", [])
+
+    for field_name, value in (
+        ("extra_cflags", extra_cflags),
+        ("extra_ldflags", extra_ldflags),
+    ):
+        if not isinstance(value, list):
+            raise ConfigError(
+                f"Toolchain field '{field_name}' must be a list."
+            )
+        if not all(isinstance(item, str) for item in value):
+            raise ConfigError(
+                f"Toolchain field '{field_name}' must contain only strings."
+            )
+
     return ToolchainConfig(
         compiler=raw.get("compiler", "gcc"),
         arch=raw.get("arch", "x86_64"),
         prefix=raw.get("prefix"),
         sysroot=raw.get("sysroot"),
-        extra_cflags=raw.get("extra_cflags", []),
-        extra_ldflags=raw.get("extra_ldflags", []),
+        extra_cflags=extra_cflags,
+        extra_ldflags=extra_ldflags,
     )
 
 
@@ -285,18 +309,25 @@ def load_config(config_path: str | Path) -> ProjectConfig:
 
     # --- packages section (optional, Phase 2) ---
     packages: List[PackageDep] = []
-    raw_packages = raw.get("packages", [])
-
-    if isinstance(raw_packages, list):
-        for p in raw_packages:
-            if isinstance(p, dict):
-                pkg_name = p.get("name", "")
-                pkg_version = p.get("version")
-
-                if pkg_name:
-                    packages.append(
-                        PackageDep(name=pkg_name, version=pkg_version)
-                    )
+    if "packages" in raw:
+        raw_packages = raw["packages"]
+        if not isinstance(raw_packages, list):
+            raise ConfigError(
+                "'packages' must be a list of package definitions."
+            )
+        for pkg in raw_packages:
+            if not isinstance(pkg, dict):
+                raise ConfigError(
+                    "Invalid package definition: expected a YAML mapping, "
+                    f"got {type(pkg).__name__}."
+                )
+            pkg_name = pkg.get("name", "")
+            pkg_version = pkg.get("version")
+            if not pkg_name:
+                raise ConfigError("Package definition must have a 'name' field.")
+            if pkg_version is not None and not isinstance(pkg_version, str):
+                pkg_version = str(pkg_version)
+            packages.append(PackageDep(name=pkg_name, version=pkg_version))
 
     return ProjectConfig(
         name=project_name,

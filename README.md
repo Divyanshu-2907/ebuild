@@ -76,6 +76,7 @@ not enough, because ebuild invokes `python -m ninja`.
 ```bash
 ebuild info             # show what ebuild parsed from build.yaml
 ebuild build            # resolve and build (auto-detects the backend)
+ebuild test             # run the project's tests
 ebuild build -j 4       # build independent packages concurrently
 ebuild clean            # remove build artifacts
 ebuild --version
@@ -94,6 +95,17 @@ Additional commands: `configure`, `install`, `add`, `list-packages`,
 `generate-board`, `generate-boot`, `analyze`, `setup`, and the `repos` group
 (`status`, `update`, `set-url`, `set-branch`, `link`, `unlink`). Run
 `ebuild --help` for the full list.
+
+
+`ebuild test` reports the counts the underlying runner printed, and reports none
+when it printed nothing recognisable — a number inferred from a zero exit status
+is a guess presented as a measurement.
+
+It also treats a run that executed **no tests** as a failure. `ctest` exits `0`
+when it finds nothing to run, and a `CMakeLists.txt` with `enable_testing()` and
+no `add_test()` still produces a `CTestTestfile.cmake` — so the runner is found,
+ctest prints `No tests were found!!!`, and trusting the exit status would report
+a green suite for a project with no tests at all.
 
 ## Test
 

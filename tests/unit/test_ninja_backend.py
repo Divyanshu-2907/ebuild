@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from ebuild.build.ninja_backend import NinjaBackend
+from ebuild.build.ninja_backend import NinjaBackend, _ninja_path
 from ebuild.core.config import ProjectConfig, TargetConfig
 
 
@@ -19,9 +19,9 @@ def _toolchain():
 
 class TestNinjaBackendSharedLibrary(unittest.TestCase):
     """A shared_library target must link with the platform's shared-object
-    flag and get the same -L/-l wiring as executables. Previously it fell
-    through to the generic `link` rule with no flags and no libs at all,
-    silently producing a broken artifact."""
+    flag and get the same -L/-l wiring as executables. Previously it used the
+    link_shared rule but emitted no ldflags and no libs line at all, so any
+    -L/-l from `uses` and any target ldflags were silently dropped."""
 
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
@@ -40,9 +40,12 @@ class TestNinjaBackendSharedLibrary(unittest.TestCase):
 
         shared_flag = "-dynamiclib" if sys.platform == "darwin" else "-shared"
         self.assertIn(shared_flag, ninja)
-        # It must use the `link` rule (compiler driver), not `ar_rule`.
+        # It must go through a compiler-driver rule, not the `ar` archiver.
+        # link_shared is that rule, and it carries the shared-object flag so
+        # the flag is never repeated in the edge's ldflags.
         lib_line = next(line for line in ninja.splitlines() if "libmylib" in line and line.startswith("build"))
-        self.assertIn(": link ", lib_line)
+        self.assertIn(": link_shared ", lib_line)
+        self.assertNotIn(": ar_rule", lib_line)
 
     def test_shared_library_gets_lib_dirs_and_libs(self):
         target = TargetConfig(
@@ -62,8 +65,60 @@ class TestNinjaBackendSharedLibrary(unittest.TestCase):
         ninja = self._generate("static", target)
 
         self.assertIn(": ar_rule", ninja)
-        self.assertNotIn("-shared", ninja)
-        self.assertNotIn("-dynamiclib", ninja)
+
+        # The link_shared *rule* is always declared in the preamble, so the
+        # bare string "-shared" is present in every generated file. What must
+        # be absent is any build *edge* that uses it.
+        edges = [line for line in ninja.splitlines() if line.startswith("build ")]
+        self.assertTrue(edges, "no build edges were generated")
+        for edge in edges:
+            self.assertNotIn(": link_shared ", edge)
+            self.assertNotIn(": link ", edge)
+
+
+class TestNinjaPathEscaping(unittest.TestCase):
+    """Ninja splits build statements on unescaped spaces and colons.
+
+    A Windows absolute path puts a drive-letter colon into the output field, so
+    Ninja read the statement as a rule separator and every generated file was
+    rejected with "expected build command name" -- the backend produced no
+    usable build on Windows at all. Paths in build statements must be escaped;
+    variable values must not be, or the flags reach the compiler mangled.
+    """
+
+    def test_colons_and_spaces_in_paths_are_escaped(self):
+        self.assertEqual(_ninja_path(r"C:\build\main.o"), r"C$:\build\main.o")
+        self.assertEqual(_ninja_path("/tmp/my project/main.o"), "/tmp/my$ project/main.o")
+
+    def test_dollar_is_escaped_before_the_escapes_it_introduces(self):
+        self.assertEqual(_ninja_path("a$b"), "a$$b")
+        self.assertEqual(_ninja_path("a$b:c"), "a$$b$:c")
+
+    def test_ordinary_posix_paths_are_unchanged(self):
+        self.assertEqual(_ninja_path("/tmp/build/obj/app/src/main.o"),
+                         "/tmp/build/obj/app/src/main.o")
+
+
+class TestNinjaWindowsStylePaths(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_build_statement_output_is_escaped(self):
+        build_dir = Path(self._tmpdir.name) / "b"
+        target = TargetConfig(name="app", target_type="executable", sources=["main.c"])
+        config = ProjectConfig(name="proj", version="1.0", targets=[target],
+                               source_dir=build_dir)
+        NinjaBackend(config, build_dir, _toolchain()).generate()
+        ninja = (build_dir / "build.ninja").read_text(encoding="utf-8")
+
+        for line in ninja.splitlines():
+            if not line.startswith("build "):
+                continue
+            # Exactly one unescaped colon per build statement: the one that
+            # separates outputs from the rule name.
+            without_escapes = line.replace("$:", "").replace("$$", "")
+            self.assertEqual(without_escapes.count(":"), 1, line)
 
 
 if __name__ == "__main__":
