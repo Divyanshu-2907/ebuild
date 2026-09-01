@@ -54,14 +54,9 @@ def test_shared_library_links_with_the_platform_shared_flag(tmp_path):
 
     ninja_file = (tmp_path / "build" / "build.ninja").read_text(encoding="utf-8")
     shared_flag = "-dynamiclib" if sys.platform == "darwin" else "-shared"
-
-    lib_line = next(
-        line for line in ninja_file.splitlines()
-        if line.startswith("build ") and "libexample" in line
-    )
-    assert ": link " in lib_line
-    assert f"ldflags = {shared_flag}" in ninja_file
-    assert "link_shared" not in ninja_file
+    assert f"rule link_shared\n  command = $cc {shared_flag}" in ninja_file
+    assert "build " in ninja_file
+    assert ": link_shared " in ninja_file
 
 
 def test_cc_rule_emits_and_consumes_a_depfile(tmp_path):

@@ -71,6 +71,49 @@ def test_toolchain_must_be_mapping(tmp_path):
         load_config(path)
 
 
+@pytest.mark.parametrize("field_name", ["extra_cflags", "extra_ldflags"])
+def test_toolchain_extra_flag_fields_must_be_lists(tmp_path, field_name):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "demo"},
+            "toolchain": {
+                "compiler": "arm-none-eabi",
+                field_name: "-mcpu=cortex-m4",
+            },
+        },
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=rf"'toolchain\.{field_name}' must be a list",
+    ):
+        load_config(path)
+
+
+@pytest.mark.parametrize("field_name", ["extra_cflags", "extra_ldflags"])
+def test_toolchain_extra_flag_fields_must_contain_only_strings(
+    tmp_path,
+    field_name,
+):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "demo"},
+            "toolchain": {
+                "compiler": "arm-none-eabi",
+                field_name: ["-mcpu=cortex-m4", 7],
+            },
+        },
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=rf"'toolchain\.{field_name}' must contain only strings",
+    ):
+        load_config(path)
+
+
 def test_toolchain_mapping_is_parsed(tmp_path):
     path = write_config(
         tmp_path,
