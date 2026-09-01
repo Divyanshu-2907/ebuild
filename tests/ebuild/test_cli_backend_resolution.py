@@ -156,7 +156,8 @@ def test_configure_generates_ninja_for_explicit_ninja_backend(tmp_path, monkeypa
     result = _invoke_configure(config_path)
 
     assert result.exit_code == 0
-    assert generate_calls["build_dir"] == Path("_build")
+    # A relative --build-dir is anchored to the project, not the process cwd.
+    assert generate_calls["build_dir"] == tmp_path / "_build"
     assert "Generated" in result.output
 
 
@@ -175,7 +176,8 @@ def test_configure_auto_detects_ninja_when_no_backend_markers_exist(tmp_path, mo
     result = _invoke_configure(config_path)
 
     assert result.exit_code == 0
-    assert generate_calls["build_dir"] == Path("_build")
+    # A relative --build-dir is anchored to the project, not the process cwd.
+    assert generate_calls["build_dir"] == tmp_path / "_build"
     assert "Auto-detected backend: ninja" in result.output
 
 

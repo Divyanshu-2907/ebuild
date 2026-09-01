@@ -102,6 +102,7 @@ class ProjectConfig:
     source_dir: Path = field(default_factory=lambda: Path("."))
     backend: str = "auto"
     backend_config: Dict[str, Any] = field(default_factory=dict)
+    system_config: Dict[str, Any] = field(default_factory=dict)
 
     def get_target(self, name: str) -> Optional[TargetConfig]:
         for t in self.targets:
@@ -165,21 +166,8 @@ def _parse_target(raw: Any) -> TargetConfig:
 
 def _parse_toolchain(raw: Dict[str, Any]) -> ToolchainConfig:
     """Parse toolchain section into a ToolchainConfig."""
-    extra_cflags = raw.get("extra_cflags", [])
-    extra_ldflags = raw.get("extra_ldflags", [])
-
-    for field_name, value in (
-        ("extra_cflags", extra_cflags),
-        ("extra_ldflags", extra_ldflags),
-    ):
-        if not isinstance(value, list):
-            raise ConfigError(
-                f"Toolchain field '{field_name}' must be a list."
-            )
-        if not all(isinstance(item, str) for item in value):
-            raise ConfigError(
-                f"Toolchain field '{field_name}' must contain only strings."
-            )
+    extra_cflags = _parse_toolchain_flag_list(raw, "extra_cflags")
+    extra_ldflags = _parse_toolchain_flag_list(raw, "extra_ldflags")
 
     return ToolchainConfig(
         compiler=raw.get("compiler", "gcc"),
@@ -189,6 +177,22 @@ def _parse_toolchain(raw: Dict[str, Any]) -> ToolchainConfig:
         extra_cflags=extra_cflags,
         extra_ldflags=extra_ldflags,
     )
+
+
+def _parse_toolchain_flag_list(
+    raw: Dict[str, Any], field_name: str
+) -> List[str]:
+    """Parse a toolchain flag list field."""
+    value = raw.get(field_name, [])
+    label = f"toolchain.{field_name}"
+
+    if not isinstance(value, list):
+        raise ConfigError(f"'{label}' must be a list.")
+
+    if not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"'{label}' must contain only strings.")
+
+    return list(value)
 
 
 def load_config(config_path: str | Path) -> ProjectConfig:
@@ -245,13 +249,16 @@ def load_config(config_path: str | Path) -> ProjectConfig:
 
     if not isinstance(backend_config, dict):
         raise ConfigError("'backend_config' must be a mapping.")
+    backend_config = dict(backend_config)
 
-    # For system builds, pull from 'system' section
-    if raw.get("system") and isinstance(raw["system"], dict):
-        backend_config.update(raw["system"])
-
-        if backend == "auto":
-            backend = "system"
+    # System-image settings are not a compilation backend. Keep them separate
+    # so normal backend selection can still auto-detect CMake, Ninja, etc.
+    system_config = raw.get("system", {})
+    if system_config is None:
+        system_config = {}
+    if not isinstance(system_config, dict):
+        raise ConfigError("'system' must be a mapping.")
+    system_config = dict(system_config)
 
     # For cmake/make/meson builds, pull defines from config
     if raw.get("cmake") and isinstance(raw["cmake"], dict):
