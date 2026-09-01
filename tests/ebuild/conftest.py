@@ -17,8 +17,20 @@ import pytest
 # ── Repo roots (available to all tests via conftest) ─────────
 # tests/ebuild/conftest.py → parent = tests/ebuild/ → parent = tests/ → parent = repo root
 EBUILD_ROOT = Path(__file__).resolve().parent.parent.parent
-EBOOT_ROOT = EBUILD_ROOT.parent / "eboot"
-EOS_ROOT = EBUILD_ROOT.parent / "eos"
+
+
+def _sibling_repo(*names: str) -> Path:
+    """First existing sibling dir, preferring the first name if none exist."""
+    parent = EBUILD_ROOT.parent
+    for name in names:
+        candidate = parent / name
+        if candidate.is_dir():
+            return candidate
+    return parent / names[0]
+
+
+EBOOT_ROOT = _sibling_repo("eboot", "eBoot")
+EOS_ROOT = _sibling_repo("eos")
 
 
 def _module_available(name: str) -> bool:
