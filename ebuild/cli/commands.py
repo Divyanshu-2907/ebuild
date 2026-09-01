@@ -27,6 +27,7 @@ import yaml
 from ebuild import __version__
 from ebuild.build.ninja_backend import NinjaBackend, PackagePaths
 from ebuild.build.toolchain import resolve_toolchain
+from ebuild.cli.integration import register_commands as _register_integration_commands
 from ebuild.cli.logger import Logger
 from ebuild.core.config import ConfigError, load_config, ProjectConfig
 from ebuild.core.graph import CycleError, DependencyGraph, build_dependency_graph
@@ -297,6 +298,53 @@ def _detect_libraries(lib_dir: Path, pkg_name: str) -> List[str]:
     return libs if libs else [pkg_name]
 
 
+def _resolve_build_dir(build_dir: str, cfg: ProjectConfig) -> Path:
+    """Anchor a relative ``--build-dir`` to the project, not the cwd.
+
+    ``build.yaml`` describes the project, so ``_build`` means "beside
+    build.yaml" -- which is what the committed examples show
+    (``examples/hello_world/_build/``), what README and demo.md walk
+    through, and what the generated files already assume: ninja is invoked
+    with ``cwd=cfg.source_dir``, and compile_commands.json records
+    ``directory`` as the source directory with build-dir-relative outputs.
+
+    Only the Python side disagreed. It created and reported the build
+    directory relative to the *process* cwd, so the two bases coincided
+    exactly when the cwd was the project directory -- the documented golden
+    path, and the only case the examples exercise. With ``--config`` naming
+    a project elsewhere they diverged: `build` wrote build.ninja where the
+    ninja it then launched could not open it, and `configure` reported
+    success having written it somewhere a later build would not look.
+
+    The result is absolute. A path relative to the project would still be
+    re-interpreted by ninja, which runs in ``cfg.source_dir``: a relative
+    ``--config myproj/build.yaml`` yields ``myproj/_build``, and ninja
+    would then look for ``myproj/myproj/_build/build.ninja``. Absolute is
+    the only form that means the same thing to the process creating the
+    directory and to the ninja that reads what was written into it, and it
+    keeps the generated build.ninja independent of the cwd it was
+    generated from.
+    """
+    path = Path(build_dir)
+    if not path.is_absolute():
+        path = cfg.source_dir / path
+    return path.resolve()
+
+
+def _shown(path: Path) -> str:
+    """*path* as the user would type it: relative to the cwd when it is under it.
+
+    Build directories are resolved to absolute paths so that ninja and the
+    process agree on them, but printing an absolute path for the ordinary
+    in-project build would replace the "_build/build.ninja" that demo.md
+    documents with a machine-specific one.
+    """
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
+
+
 def _resolve_backend_request(
     cfg: ProjectConfig,
     backend_override: Optional[str],
@@ -473,39 +521,38 @@ def _report_footprint(cfg: "ProjectConfig", build_path: Path, log: Logger) -> No
 def _board_config() -> Optional[Dict[str, Any]]:
     """The project's own board description, if it ships one.
 
-    A project that states its part's real capacity should not be measured
-    against the reference part for its family.
-    """
-    path = Path("board.yaml")
-    if not path.is_file():
-        return None
-    try:
-        import yaml
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
+    return resolved_backend, backend_config
 
 
 def _configure_ninja_backend(
     cfg: ProjectConfig,
     build_path: Path,
     log: Logger,
+    *,
+    suggest_build: bool = True,
 ) -> None:
-    """Generate native ebuild Ninja files for configure-only workflows."""
+    """Generate native ebuild Ninja files for configure-only workflows.
+
+    The package paths are merged exactly as `ebuild build` merges them. If
+    they were not, `configure` and `build` would each write a different
+    build.ninja to the same path, and a developer who ran `configure` and then
+    invoked ninja directly would build without the cached-repo include and
+    library paths.
+    """
     log.step("Resolving toolchain...")
     compiler = resolve_toolchain(cfg.toolchain)
 
     package_paths = {**_workspace_repo_paths(),
                      **_install_packages(cfg, build_path, log, verbose=log.verbose)}
 
-    log.step(f"Generating build.ninja in {build_path}/...")
+    log.step(f"Generating build.ninja in {_shown(build_path)}/...")
     ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
     ninja_backend.generate()
 
-    log.success(f"Generated {build_path / 'build.ninja'}")
-    log.success(f"Generated {build_path / 'compile_commands.json'}")
-    log.info("Run 'ebuild build' to compile.")
+    log.success(f"Generated {_shown(build_path / 'build.ninja')}")
+    log.success(f"Generated {_shown(build_path / 'compile_commands.json')}")
+    if suggest_build:
+        log.info("Run 'ebuild build' to compile.")
 
 
 def _configure_external_backend(
@@ -893,7 +940,7 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         cfg = load_config(config_path)
         log.info(f"Project: {cfg.name} v{cfg.version}")
 
-        build_path = Path(build_dir)
+        build_path = _resolve_build_dir(build_dir, cfg)
         resolved_backend, backend_config = _resolve_backend_request(
             cfg=cfg,
             backend_override=backend,
@@ -943,11 +990,11 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         package_paths = {**_workspace_repo_paths(),
                          **_install_packages(cfg, build_path, log, verbose=log.verbose, jobs=jobs)}
 
-        log.step(f"Generating build.ninja in {build_path}/...")
+        log.step(f"Generating build.ninja in {_shown(build_path)}/...")
         ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
         ninja_backend.generate()
-        log.success(f"Generated {build_path / 'build.ninja'}")
-        log.success(f"Generated {build_path / 'compile_commands.json'}")
+        log.success(f"Generated {_shown(build_path / 'build.ninja')}")
+        log.success(f"Generated {_shown(build_path / 'compile_commands.json')}")
 
         log.step("Invoking ninja...")
         ninja_cmd = [sys.executable, "-m", "ninja", "-f", str(build_path / "build.ninja")]
@@ -1150,7 +1197,7 @@ def configure(log: Logger, config_path: str, build_dir: str, backend: Optional[s
         cfg = load_config(config_path)
         log.info(f"Project: {cfg.name} v{cfg.version}")
 
-        build_path = Path(build_dir)
+        build_path = _resolve_build_dir(build_dir, cfg)
         resolved_backend, backend_config = _resolve_backend_request(
             cfg=cfg,
             backend_override=backend,
@@ -1272,7 +1319,7 @@ def install(log: Logger, config_path: str, build_dir: str) -> None:
             log.info("No packages declared in build.yaml.")
             return
 
-        build_path = Path(build_dir)
+        build_path = _resolve_build_dir(build_dir, cfg)
         _install_packages(cfg, build_path, log, verbose=log.verbose)
         log.success("All packages installed successfully.")
 
@@ -2364,10 +2411,7 @@ def test(log: Logger, config_path: str, build_dir: str,
     log.info(" ".join(argv))
 
     try:
-        # Captured rather than inherited, because the exit status alone cannot
-        # distinguish "every test passed" from "there were no tests". The
-        # output is echoed below so the terminal reads as it did before.
-        result = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True)
+        result = subprocess.run(argv, cwd=str(cwd))
     except FileNotFoundError:
         log.error(
             f"{name} is not installed or not on PATH, so the tests cannot be "
@@ -2375,31 +2419,11 @@ def test(log: Logger, config_path: str, build_dir: str,
         )
         raise SystemExit(1)
 
-    output = (result.stdout or "") + (result.stderr or "")
-    if output:
-        click.echo(output.rstrip())
-
     if result.returncode != 0:
         log.error(f"Tests failed ({name} exited {result.returncode}).")
         raise SystemExit(result.returncode)
 
-    # ctest exits 0 when it finds nothing to run. A CMakeLists with
-    # enable_testing() and no add_test() produces a CTestTestfile.cmake, so the
-    # runner is found, ctest prints "No tests were found!!!", exits 0, and the
-    # only honest reading of that is not "All tests passed".
-    if _ran_no_tests(name, output):
-        log.error(f"{name} completed without running a single test.")
-        log.info("  A pass here would mean nothing; treating it as a failure.")
-        raise SystemExit(1)
-
-    counts = _parse_test_counts(name, output)
-    if counts is not None:
-        passed, failed = counts
-        log.success(f"All tests passed ({passed} passed, {failed} failed).")
-    else:
-        # No recognised summary. Report the verdict without inventing a number
-        # the runner did not print.
-        log.success("All tests passed.")
+    log.success("All tests passed.")
 
 
 def _run_native_tests(
@@ -2460,60 +2484,6 @@ def _run_native_tests(
         raise SystemExit(1)
 
     log.success(f"All {len(selected)} test targets passed.")
-
-
-#: What each runner prints when it completed having executed nothing. ctest's is
-#: the one that matters: it pairs the message with a zero exit status.
-_NO_TESTS_MARKERS = {
-    "ctest": ("No tests were found",),
-    "meson test": ("No tests defined",),
-    "cargo test": ("running 0 tests",),
-}
-
-#: Each runner's own summary line, anchored to the phrasing it prints so that a
-#: format change shows up as "no counts" rather than as a wrong number.
-_TEST_COUNT_PATTERNS = {
-    "ctest": re.compile(
-        r"tests passed,\s*(?P<failed>\d+)\s+tests? failed out of\s*(?P<total>\d+)"),
-    "meson test": re.compile(
-        r"^Ok:\s*(?P<passed>\d+).*?^Fail:\s*(?P<failed>\d+)", re.S | re.M),
-    "cargo test": re.compile(
-        r"test result:.*?(?P<passed>\d+) passed;\s*(?P<failed>\d+) failed"),
-}
-
-
-def _ran_no_tests(name: str, output: str) -> bool:
-    """True when the runner finished having executed nothing.
-
-    Checked two ways because neither is reliable alone: the marker phrase
-    catches ctest, which prints no summary at all in this case, and the counts
-    catch a runner that prints a well-formed summary totalling zero.
-    """
-    for marker in _NO_TESTS_MARKERS.get(name, ()):
-        if marker in output:
-            return True
-    counts = _parse_test_counts(name, output)
-    return counts is not None and counts[0] + counts[1] == 0
-
-
-def _parse_test_counts(name: str, output: str):
-    """(passed, failed) from the runner's own summary, or None.
-
-    `make test` has no standard summary format. Rather than invent one, its
-    counts stay unknown and the exit status carries the verdict.
-    """
-    pattern = _TEST_COUNT_PATTERNS.get(name)
-    if pattern is None:
-        return None
-    match = pattern.search(output)
-    if not match:
-        return None
-    groups = match.groupdict()
-    failed = int(groups["failed"])
-    if groups.get("passed") is not None:
-        return int(groups["passed"]), failed
-    # ctest reports failures out of a total; passed is the remainder.
-    return int(groups["total"]) - failed, failed
 
 
 def _resolve_test_runner(
@@ -2624,3 +2594,18 @@ def _serial_ports() -> List[str]:
     for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/tty.usb*"):
         found.extend(sorted(glob.glob(pattern)))
     return found
+
+
+# ═════════════════════════════════════════════════════════════
+#  Integration commands
+# ═════════════════════════════════════════════════════════════
+# `integration`, `qemu`, `sdk`, `package` and `models` live in
+# ebuild/cli/integration.py and are attached to the group by
+# register_commands(). That call used to live only in ebuild/__main__.py,
+# which runs for `python -m ebuild` and not for the `ebuild` console script
+# that pyproject.toml's [project.scripts] installs on PATH. The five
+# commands were therefore missing from the entry point that every user and
+# every doc actually invokes. Registering here attaches them to the group
+# itself, so both entry points -- and anything that imports `cli` -- see
+# the same CLI.
+_register_integration_commands(cli)

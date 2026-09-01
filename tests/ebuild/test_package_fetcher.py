@@ -10,6 +10,7 @@ extracted from the wrong archive carries the wrong marker.
 """
 
 import hashlib
+import gzip
 import io
 import tarfile
 
@@ -57,14 +58,28 @@ def make_recipe(name, version="2.9.3", url=None, checksum=None):
 
 
 def targz_bytes(marker):
-    """A valid .tar.gz containing a single file whose body is *marker*."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    """A valid .tar.gz containing a single file whose body is *marker*.
+
+    Byte-for-byte reproducible. Both the tar header and the gzip header carry a
+    timestamp, and the defaults are "now" -- so two calls with the same marker
+    produced different bytes, and therefore different SHA-256, if they landed on
+    opposite sides of a second boundary. That made every checksum derived from
+    this helper a coin flip: the digest computed for the recipe had to match the
+    bytes handed out by fake_download later. It held on fast Linux runners and
+    failed on Windows. Pinning both timestamps to 0 removes the race.
+    """
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
         data = marker.encode("utf-8")
         info = tarfile.TarInfo("pkg/marker.txt")
         info.size = len(data)
+        info.mtime = 0
         tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
+
+    out = io.BytesIO()
+    with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz:
+        gz.write(raw.getvalue())
+    return out.getvalue()
 
 
 def sha256_of(data):

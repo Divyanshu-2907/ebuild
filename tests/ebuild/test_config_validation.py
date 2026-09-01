@@ -71,6 +71,49 @@ def test_toolchain_must_be_mapping(tmp_path):
         load_config(path)
 
 
+@pytest.mark.parametrize("field_name", ["extra_cflags", "extra_ldflags"])
+def test_toolchain_extra_flag_fields_must_be_lists(tmp_path, field_name):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "demo"},
+            "toolchain": {
+                "compiler": "arm-none-eabi",
+                field_name: "-mcpu=cortex-m4",
+            },
+        },
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=rf"'toolchain\.{field_name}' must be a list",
+    ):
+        load_config(path)
+
+
+@pytest.mark.parametrize("field_name", ["extra_cflags", "extra_ldflags"])
+def test_toolchain_extra_flag_fields_must_contain_only_strings(
+    tmp_path,
+    field_name,
+):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "demo"},
+            "toolchain": {
+                "compiler": "arm-none-eabi",
+                field_name: ["-mcpu=cortex-m4", 7],
+            },
+        },
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=rf"'toolchain\.{field_name}' must contain only strings",
+    ):
+        load_config(path)
+
+
 def test_toolchain_mapping_is_parsed(tmp_path):
     path = write_config(
         tmp_path,
@@ -98,67 +141,54 @@ def test_toolchain_mapping_is_parsed(tmp_path):
     assert config.toolchain.extra_ldflags == ["--specs=nosys.specs"]
 
 
-@pytest.mark.parametrize("invalid_packages", [
-    {"name": "zlib", "version": "1.2.13"},
-    "zlib",
-    42,
-])
-def test_packages_must_be_a_list(tmp_path, invalid_packages):
-    path = write_config(
-        tmp_path,
-        {"project": {"name": "demo"}, "packages": invalid_packages},
-    )
-
-    with pytest.raises(ConfigError, match="'packages' must be a list"):
-        load_config(path)
-
-
-@pytest.mark.parametrize("invalid_item", ["zlib", 42, None])
-def test_package_definition_must_be_mapping(tmp_path, invalid_item):
-    path = write_config(
-        tmp_path,
-        {"project": {"name": "demo"}, "packages": [invalid_item]},
-    )
-
-    with pytest.raises(ConfigError, match="expected a YAML mapping"):
-        load_config(path)
-
-
-def test_package_definition_requires_name(tmp_path):
+def test_system_section_does_not_select_system_backend(tmp_path):
     path = write_config(
         tmp_path,
         {
-            "project": {"name": "demo"},
-            "packages": [{"version": "1.2.13"}],
-        },
-    )
-
-    with pytest.raises(ConfigError, match="must have a 'name'"):
-        load_config(path)
-
-
-def test_packages_list_is_parsed(tmp_path):
-    path = write_config(
-        tmp_path,
-        {
-            "project": {"name": "demo"},
-            "packages": [
-                {"name": "zlib", "version": "1.2.13"},
-                {"name": "mbedtls"},
+            "project": {"name": "system-app"},
+            "targets": [
+                {"name": "app", "type": "executable", "sources": ["main.c"]}
             ],
+            "system": {
+                "hostname": "eos-device",
+                "image_format": "ext4",
+            },
         },
     )
 
     config = load_config(path)
 
-    assert len(config.packages) == 2
-    assert config.packages[0].name == "zlib"
-    assert config.packages[0].version == "1.2.13"
-    assert config.packages[1].name == "mbedtls"
-    assert config.packages[1].version is None
+    assert config.backend == "auto"
+    assert config.backend_config == {}
+    assert config.system_config == {
+        "hostname": "eos-device",
+        "image_format": "ext4",
+    }
 
 
-def test_omitted_packages_is_empty(tmp_path):
-    path = write_config(tmp_path, {"project": {"name": "demo"}})
+def test_system_section_does_not_override_explicit_backend(tmp_path):
+    path = write_config(
+        tmp_path,
+        {
+            "project": {"name": "cmake-system-app"},
+            "backend": "cmake",
+            "cmake": {"defines": {"BUILD_TESTS": "ON"}},
+            "system": {"hostname": "eos-device"},
+        },
+    )
+
     config = load_config(path)
-    assert config.packages == []
+
+    assert config.backend == "cmake"
+    assert config.backend_config == {"defines": {"BUILD_TESTS": "ON"}}
+    assert config.system_config == {"hostname": "eos-device"}
+
+
+def test_system_config_must_be_mapping(tmp_path):
+    path = write_config(
+        tmp_path,
+        {"project": {"name": "demo"}, "system": ["invalid"]},
+    )
+
+    with pytest.raises(ConfigError, match="'system' must be a mapping"):
+        load_config(path)

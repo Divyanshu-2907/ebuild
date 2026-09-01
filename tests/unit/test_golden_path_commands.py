@@ -9,6 +9,7 @@ and the scaffolding has to produce a project they succeed on. These are the
 regression guards for the steps that were missing or broken.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -111,8 +112,16 @@ class TestTestTargetType:
                      SimpleNamespace(cc="cc", cxx="c++", ar="ar")).generate()
         ninja = (tmp_path / "b" / "build.ninja").read_text(encoding="utf-8")
 
+        # Split on the first *unescaped* colon: that is the one separating
+        # outputs from the rule name. A plain l.split(":")[0] picks the drive
+        # letter apart from the rest on Windows, so the .o filter never matched
+        # and this selected the compile edge instead of the link edge.
+        def outputs(line):
+            return re.split(r"(?<!\$):", line, maxsplit=1)[0]
+
         edge = next(l for l in ninja.splitlines()
-                    if l.startswith("build ") and "t_smoke" in l and ".o" not in l.split(":")[0])
+                    if l.startswith("build ") and "t_smoke" in l
+                    and ".o" not in outputs(l))
         assert ": link " in edge
         assert ": ar_rule" not in edge
 
