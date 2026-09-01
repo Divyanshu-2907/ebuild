@@ -31,42 +31,23 @@ _PIC_FLAGS = {"-fPIC", "-fpic", "-fPIE", "-fpie", "-fno-pic", "-fno-PIC",
               "-fno-pie", "-fno-PIE"}
 
 
-def _ninja_path(path) -> str:
-    """Escape *path* for use in a Ninja build statement.
+def escape_ninja_path(path) -> str:
+    """Escape a path for use inside a Ninja build statement.
 
-    Ninja splits build statements on unescaped spaces and colons, so a Windows
-    absolute path writes a drive letter that Ninja reads as the output/rule
-    separator:
+    Ninja's lexer ends the output list at the first unescaped ``:`` and splits
+    on unescaped spaces, so a Windows drive letter or a directory containing a
+    space does not raise an error -- it silently parses into several wrong
+    targets. ``C:\\Users\\Jane Doe\\build\\app.o`` becomes four targets
+    (``C``, ``...\\Jane``, ``Doe``, ``build\\app.o``) instead of one.
 
-        build C:\\...\\main.o: cc main.c
-              ^ "expected build command name"
+    ``$`` is replaced first: the space and colon replacements introduce ``$``
+    characters that must not be escaped again.
 
-    `$` is escaped first so the escapes introduced below are not re-escaped.
-    Only build statements need this; variable values (cflags, ldflags) are read
-    to end of line and must not be escaped, or the flags reach the compiler
-    mangled.
+    Only the manifest needs this. Ninja shell-quotes ``$in``/``$out`` itself
+    when it builds the command line, so an escaped path still reaches the
+    compiler as a single argument.
     """
-    text = str(path)
-    return text.replace("$", "$$").replace(":", "$:").replace(" ", "$ ")
-
-
-def _ninja_path(path) -> str:
-    """Escape *path* for use in a Ninja build statement.
-
-    Ninja splits build statements on unescaped spaces and colons, so a Windows
-    absolute path writes a drive letter that Ninja reads as the output/rule
-    separator:
-
-        build C:\\...\\main.o: cc main.c
-              ^ "expected build command name"
-
-    `$` is escaped first so the escapes introduced below are not re-escaped.
-    Only build statements need this; variable values (cflags, ldflags) are read
-    to end of line and must not be escaped, or the flags reach the compiler
-    mangled.
-    """
-    text = str(path)
-    return text.replace("$", "$$").replace(":", "$:").replace(" ", "$ ")
+    return str(path).replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
 
 
 class NinjaBackend:
@@ -207,10 +188,10 @@ class NinjaBackend:
 
             obj_files = []
             for src in target.sources:
-                obj = str(self._object_path(target, src))
+                obj = escape_ninja_path(self._object_path(target, src))
                 obj_files.append(obj)
                 lines.append(
-                    f"build {_ninja_path(obj)}: cc {_ninja_path(src)}"
+                    f"build {obj}: cc {escape_ninja_path(src)}"
                 )
                 if cflags:
                     lines.append(f"  cflags = {' '.join(cflags)}")
@@ -232,10 +213,12 @@ class NinjaBackend:
                 for dep_name in target.depends:
                     for dep_target in self.config.targets:
                         if dep_target.name == dep_name and dep_target.target_type == "static_library":
-                            dep_archives.append(str(self.build_dir / f"lib{dep_name}.a"))
+                            dep_archives.append(
+                                escape_ninja_path(self.build_dir / f"lib{dep_name}.a")
+                            )
 
                 link_inputs = obj_files + dep_archives
-                out = str(self.build_dir / target.name)
+                out = escape_ninja_path(self.build_dir / target.name)
                 lines.append(
                     f"build {_ninja_path(out)}: link " f"{' '.join(_ninja_path(x) for x in link_inputs)}"
                 )
@@ -252,7 +235,7 @@ class NinjaBackend:
                     ext = ".dylib"
                 else:
                     ext = ".so"
-                out = str(self.build_dir / f"lib{target.name}{ext}")
+                out = escape_ninja_path(self.build_dir / f"lib{target.name}{ext}")
 
                 if target.target_type == "static_library":
                     lines.append(f"build {_ninja_path(out)}: ar_rule " f"{' '.join(_ninja_path(x) for x in obj_files)}")
