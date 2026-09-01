@@ -15,33 +15,83 @@ from typing import Dict, List, Optional, Tuple
 
 from ebuild.packages.recipe import PackageRecipe, RecipeError, load_recipe
 
-_LEADING_DIGITS = re.compile(r"(\d*)(.*)")
+# Everything from the first '-' or '+' is a suffix: a pre-release tag
+# ("3.6.0-rc1") or build metadata ("1.3.1+patch2").
+_SUFFIX_SPLIT = re.compile(r"[-+]")
+
+_ComponentKey = Tuple[int, int, str]
 
 
-def _component_key(component: str) -> Tuple[int, str]:
-    """Sort key for one dot-separated component of a version string.
+def _component_key(component: str) -> _ComponentKey:
+    """Order one dot-separated component of a version string.
 
-    Splits the leading digits from any trailing text so "11" sorts above "2"
-    numerically, and "11b" sorts just above "11".
+    Numeric components compare numerically, so 1.10.0 still sorts above
+    1.9.0. Anything else compares as text and ranks below any numeric
+    component, which keeps the ordering total without inventing a meaning
+    for identifiers the recipe format does not define.
     """
-    digits, rest = _LEADING_DIGITS.match(component).groups()
-    return (int(digits) if digits else 0, rest)
+    if component.isdigit():
+        return (1, int(component), "")
+    return (0, 0, component)
 
 
-def version_key(version: str) -> Tuple[Tuple[Tuple[int, str], ...], bool, str]:
-    """Sort key for a version string, tolerant of non-numeric parts.
+def version_sort_key(version: str) -> tuple:
+    """Sort key for a package version string.
 
-    Real-world versions are not always all digits — "3.6.0-rc1", "1.2.11b" and
-    "2.9.3p1" all occur upstream. Comparing them numerically raises ValueError,
-    and comparing them as plain strings puts "11.1.0" below "2.9.3".
+    ``PackageRecipe.validate()`` accepts any non-empty version, and real
+    embedded recipes use more than dotted integers: a leading ``v``
+    (``v2.9.3``, littlefs's own tag format), pre-release tags
+    (``3.6.0-rc1``) and build metadata (``1.3.1+patch2``). Ordering used to
+    be ``[int(x) for x in version.split('.')]``, which raised ValueError on
+    every one of them -- and did so from ``get()``, ``list_packages()`` and
+    ``list_all_versions()``, so a single such recipe anywhere in the
+    registry took down package lookup for the whole project.
 
-    A pre-release suffix lowers precedence, so 3.6.0-rc1 sorts below 3.6.0.
+    Ordering rules:
+      * an optional leading ``v`` or ``V`` is ignored;
+      * the release part is compared component by component, numerically
+        where a component is all digits;
+      * a version carrying a pre-release or build suffix sorts below the
+        otherwise-equal version without one, so 3.6.0-rc1 < 3.6.0;
+      * nothing raises -- any string has a place in the order.
     """
-    release, _, pre_release = version.partition("-")
-    components = tuple(_component_key(c) for c in release.split("."))
-    # `not pre_release` is True for a final release, which sorts above any
-    # pre-release sharing the same components.
-    return (components, not pre_release, pre_release)
+    text = version.strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+
+    parts = _SUFFIX_SPLIT.split(text, maxsplit=1)
+    release = tuple(_component_key(c) for c in parts[0].split("."))
+
+    if len(parts) == 1:
+        return (release, 1, ())
+    suffix = tuple(_component_key(c) for c in re.split(r"[.\-+]", parts[1]))
+    return (release, 0, suffix)
+
+
+def _version_sort_key(version: str) -> tuple:
+    """Ordering key for a recipe version string.
+
+    The recipe format documents no version grammar, and every bundled recipe
+    uses dot-separated integers (``1.3.1``, ``11.1.0``). That is the format
+    this registry orders: components are compared numerically, so ``1.10.0``
+    correctly sorts above ``1.9.0``.
+
+    Anything else -- a Debian revision (``1.2.13-1``), a prerelease
+    (``3.6.0-rc1``), a ``v``-prefixed upstream tag (``v2.9.3``) -- is outside
+    that format. Rather than guess at its ordering, such a version is ranked
+    below every numeric one and ordered lexicographically among its peers.
+    Ranking it below matters for ``get()``: with ``3.6.0`` and ``3.6.0-rc1``
+    both registered, the plain numeric release is chosen as latest.
+
+    Returning a key instead of raising keeps a single out-of-format recipe
+    from breaking commands that merely enumerate the registry -- including
+    the resolver's "package not found" message, which lists every known
+    package and so used to fail with ValueError instead of ResolveError.
+    """
+    parts = version.split(".")
+    if parts and all(part.isdigit() for part in parts):
+        return (1, tuple(int(part) for part in parts), "")
+    return (0, (), version)
 
 
 class PackageRegistry:
@@ -103,7 +153,7 @@ class PackageRegistry:
         if version:
             return versions.get(version)
 
-        latest_version = max(versions.keys(), key=version_key)
+        latest_version = sorted(versions.keys(), key=_version_sort_key)[-1]
         return versions[latest_version]
 
     def has(self, name: str, version: Optional[str] = None) -> bool:
@@ -115,14 +165,20 @@ class PackageRegistry:
         result = []
         for name in sorted(self._recipes.keys()):
             versions = self._recipes[name]
-            latest = max(versions.keys(), key=version_key)
+            latest = sorted(versions.keys(), key=_version_sort_key)[-1]
             result.append(versions[latest])
         return result
 
     def list_all_versions(self, name: str) -> List[PackageRecipe]:
         """Return all versions of a package."""
         versions = self._recipes.get(name, {})
-        return [versions[v] for v in sorted(versions.keys(), key=version_key)]
+        return [
+                versions[v]
+                for v in sorted(
+                    versions.keys(),
+                    key=_version_sort_key,
+                 )
+              ]
 
     @property
     def package_count(self) -> int:
