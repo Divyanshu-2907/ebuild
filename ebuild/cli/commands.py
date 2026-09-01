@@ -317,6 +317,94 @@ def _resolve_backend_request(
     return resolved_backend, backend_config
 
 
+def _selected_board(default: str = "generic") -> str:
+    """The board this project targets, from its eos.yaml.
+
+    Read rather than passed in: `ebuild build` takes no --board of its own in
+    the documented walk, so the value has to survive from `ebuild new` or
+    `ebuild configure`.
+    """
+    path = Path("eos.yaml")
+    if not path.is_file():
+        return default
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return default
+    return (data.get("system") or {}).get("board") or default
+
+
+def _report_footprint(cfg: "ProjectConfig", build_path: Path, log: Logger) -> None:
+    """Print how much of the board the build just used.
+
+    The MLP walk ends with a build that says `Flash: 384 KB / RAM: 72 KB`. A
+    developer who has to run `size` themselves and remember which columns to
+    add is not being told; they are being left to find out.
+
+    Never fatal. A footprint that cannot be measured -- no binutils, a cross
+    toolchain whose `size` is not installed -- is a missing convenience, and
+    failing a successful build over it would be worse than the silence it
+    replaces.
+    """
+    from ebuild.build.footprint import (
+        FootprintError, board_capacity, find_size_tool, format_report,
+        measure, over_budget,
+    )
+
+    binaries = [t for t in cfg.targets if t.target_type == "executable"]
+    if not binaries:
+        return
+
+    artifact = build_path / binaries[0].name
+    if not artifact.is_file():
+        return
+
+    prefix = getattr(cfg.toolchain, "target", None) or "host"
+    tool = find_size_tool(prefix)
+    if tool is None:
+        log.debug(f"no size tool for toolchain {prefix!r}; skipping footprint")
+        return
+
+    try:
+        fp = measure(artifact, tool)
+    except FootprintError as exc:
+        log.debug(f"footprint unavailable: {exc}")
+        return
+
+    board = _selected_board(default="")
+    flash_cap, ram_cap = board_capacity(board or None, _board_config())
+    log.info("")
+    for line in format_report(fp, flash_cap, ram_cap).splitlines():
+        log.info(line)
+
+    exceeded = over_budget(fp, flash_cap, ram_cap)
+    if exceeded:
+        # Not a build failure: the image linked. It will not fit on the board,
+        # which the developer needs to hear now rather than from a device that
+        # will not boot.
+        log.warning(f"{exceeded} -- this image will not fit.")
+    else:
+        log.info("Ready to flash.")
+
+
+def _board_config() -> Optional[Dict[str, Any]]:
+    """The project's own board description, if it ships one.
+
+    A project that states its part's real capacity should not be measured
+    against the reference part for its family.
+    """
+    path = Path("board.yaml")
+    if not path.is_file():
+        return None
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _configure_ninja_backend(
     cfg: ProjectConfig,
     build_path: Path,
@@ -869,6 +957,7 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
             raise SystemExit(1)
 
         log.success("Build completed successfully.")
+        _report_footprint(cfg, build_path, log)
 
     except FileNotFoundError as e:
         log.error(_format_missing_tool(e))
@@ -2157,254 +2246,32 @@ def generate_board(
 
 
 @cli.command()
-@click.option(
-    "--config",
-    "config_path",
-    default="build.yaml",
-    type=click.Path(),
-    help="Path to the build configuration file.",
-)
-@click.option(
-    "--build-dir",
-    default="_build",
-    type=click.Path(),
-    help="Build output directory.",
-)
-@click.option(
-    "--filter",
-    "name_filter",
-    default=None,
-    help="Only run tests whose name contains this substring.",
-)
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit the checks as JSON, for CI.")
 @click.pass_obj
-def test(log: Logger, config_path: str, build_dir: str,
-         name_filter: Optional[str]) -> None:
-    """Build and run the project's tests.
+def doctor(log: Logger, as_json: bool) -> None:
+    """Diagnose the build environment in one command.
 
-    Step six of the golden path. Delegates to whichever runner the project
-    already uses -- ctest for a CMake tree, `cargo test`, `meson test`, or
-    `make test` -- rather than imposing a test framework on the project.
+    Reports what is installed, what is missing, and what each missing piece
+    would cost. Read-only: it names the fix rather than applying it.
+
+    Exits non-zero only for problems that actually stop a build, so a
+    host-only machine with no cross toolchain still passes.
     """
-    log.header("ebuild — Test")
+    from ebuild.system.doctor import exit_code, format_report, run_all
 
-    build_path = Path(build_dir)
+    checks = run_all()
 
-    try:
-        log.step("Loading configuration...")
-        cfg = load_config(config_path)
-        log.info(f"Project: {cfg.name} v{cfg.version}")
-    except FileNotFoundError:
-        log.error(
-            f"No {config_path} here. Run this from a project directory, or "
-            f"pass --config."
-        )
-        raise SystemExit(1)
-    except (ConfigError, RecipeError) as e:
-        log.error(f"Configuration error: {e}")
-        raise SystemExit(1)
+    if as_json:
+        import json as _json
+        click.echo(_json.dumps(
+            [{"name": c.name, "status": c.status,
+              "detail": c.detail, "fix": c.fix} for c in checks],
+            indent=2,
+        ))
+        raise SystemExit(exit_code(checks))
 
-    native = [t for t in cfg.targets if t.target_type == "test"]
-    if native:
-        _run_native_tests(cfg, native, build_path, log, name_filter)
-        return
-
-    runner = _resolve_test_runner(cfg.source_dir, build_path, name_filter)
-    if runner is None:
-        log.error(
-            "No test runner found for this project.\n"
-            "  ebuild test drives the project's own runner. Add one of:\n"
-            "    - CMake with enable_testing() + add_test()   -> ctest\n"
-            "    - a 'test' target in the Makefile            -> make test\n"
-            "    - Cargo.toml                                 -> cargo test\n"
-            "    - meson.build                                -> meson test"
-        )
-        raise SystemExit(1)
-
-    name, argv, cwd = runner
-    log.step(f"Running tests with {name}...")
-    log.info(" ".join(argv))
-
-    try:
-        result = subprocess.run(argv, cwd=str(cwd))
-    except FileNotFoundError:
-        log.error(
-            f"{name} is not installed or not on PATH, so the tests cannot be "
-            f"run here."
-        )
-        raise SystemExit(1)
-
-    if result.returncode != 0:
-        log.error(f"Tests failed ({name} exited {result.returncode}).")
-        raise SystemExit(result.returncode)
-
-    log.success("All tests passed.")
-
-
-def _run_native_tests(
-    cfg: "ProjectConfig",
-    targets: List[Any],
-    build_path: Path,
-    log: Logger,
-    name_filter: Optional[str],
-) -> None:
-    """Build and run the project's own ``test`` targets.
-
-    A scaffolded project has no CMake tree and no Makefile, so there is no
-    external runner to delegate to. The test binaries are ordinary ebuild
-    targets; build them the same way `ebuild build` does, then run each one
-    and treat a non-zero exit as a failure.
-    """
-    selected = [t for t in targets if not name_filter or name_filter in t.name]
-    if not selected:
-        log.error(f"No test target matches --filter {name_filter!r}.")
-        raise SystemExit(1)
-
-    log.step("Building test targets...")
-    _configure_ninja_backend(cfg, build_path, log, suggest_build=False)
-
-    from ebuild.build.dispatch import ninja_command
-
-    # Ninja addresses targets by their output path, and `ebuild build` drives
-    # it with -f from the project root, so the same form is used here.
-    argv = (
-        ninja_command()
-        + ["-f", str(build_path / "build.ninja")]
-        + [str(build_path / t.name) for t in selected]
-    )
-    result = subprocess.run(argv)
-    if result.returncode != 0:
-        log.error("Test targets failed to build.")
-        raise SystemExit(result.returncode)
-
-    failures: List[str] = []
-    for target in selected:
-        binary = build_path / target.name
-        if not binary.is_file():
-            log.error(f"{target.name}: built, but no binary at {binary}")
-            failures.append(target.name)
-            continue
-
-        log.step(f"Running {target.name}...")
-        run = subprocess.run([str(binary)])
-        if run.returncode == 0:
-            log.success(f"  {target.name}: passed")
-        else:
-            log.error(f"  {target.name}: exited {run.returncode}")
-            failures.append(target.name)
-
-    if failures:
-        log.error(f"{len(failures)} of {len(selected)} test targets failed: "
-                  + ", ".join(failures))
-        raise SystemExit(1)
-
-    log.success(f"All {len(selected)} test targets passed.")
-
-
-def _resolve_test_runner(
-    source_dir: Path,
-    build_dir: Path,
-    name_filter: Optional[str],
-) -> Optional[Tuple[str, List[str], Path]]:
-    """Pick the test runner this project already uses.
-
-    Returns ``(display_name, argv, cwd)``, or None when the project declares
-    no tests. Ordered so that an explicit CMake test registry wins over a
-    generic `make test` target in the same tree.
-    """
-    if (build_dir / "CTestTestfile.cmake").is_file():
-        argv = ["ctest", "--output-on-failure"]
-        if name_filter:
-            argv += ["-R", name_filter]
-        return "ctest", argv, build_dir
-
-    if (source_dir / "Cargo.toml").is_file():
-        argv = ["cargo", "test"]
-        if name_filter:
-            argv += [name_filter]
-        return "cargo test", argv, source_dir
-
-    if (build_dir / "meson-info").is_dir():
-        argv = ["meson", "test", "-C", str(build_dir)]
-        if name_filter:
-            argv += ["--suite", name_filter]
-        return "meson test", argv, source_dir
-
-    makefile = next(
-        (source_dir / n for n in ("Makefile", "makefile", "GNUmakefile")
-         if (source_dir / n).is_file()),
-        None,
-    )
-    if makefile is not None:
-        text = makefile.read_text(encoding="utf-8", errors="replace")
-        if re.search(r"^test\s*:", text, re.MULTILINE):
-            return "make test", ["make", "-C", str(source_dir), "test"], source_dir
-
-    return None
-
-
-@cli.command()
-@click.option("--port", default=None,
-              help="Serial device (e.g. /dev/ttyUSB0). Auto-detected if omitted.")
-@click.option("--baud", default=115200, type=int, help="Baud rate.")
-@click.pass_obj
-def monitor(log: Logger, port: Optional[str], baud: int) -> None:
-    """Attach a serial monitor to the target device.
-
-    Step eight of the golden path -- the step that shows a developer their
-    first firmware run actually produced output.
-    """
-    log.header("ebuild — Monitor")
-    log.info(f"Board: {_selected_board()}")
-
-    if port is None:
-        candidates = _serial_ports()
-        if not candidates:
-            log.error(
-                "No serial device found.\n"
-                "  Looked for /dev/ttyUSB*, /dev/ttyACM*, /dev/tty.usb*.\n"
-                "  Connect the board, or name the device with --port."
-            )
-            raise SystemExit(1)
-        if len(candidates) > 1:
-            log.error(
-                "More than one serial device is connected, so ebuild will not "
-                "guess which one is the board:\n"
-                + "\n".join(f"    {c}" for c in candidates)
-                + "\n  Choose one with --port."
-            )
-            raise SystemExit(1)
-        port = candidates[0]
-        log.info(f"Auto-detected {port}")
-
-    log.step(f"Opening {port} at {baud} baud... (Ctrl-C to exit)")
-
-    try:
-        import serial  # type: ignore[import-untyped]
-    except ImportError:
-        log.error(
-            "pyserial is not installed, so the monitor cannot open the port.\n"
-            "  Install it with:  pip install pyserial"
-        )
-        raise SystemExit(1)
-
-    try:
-        with serial.Serial(port, baud, timeout=0.2) as conn:
-            while True:
-                chunk = conn.read(4096)
-                if chunk:
-                    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
-                    sys.stdout.flush()
-    except KeyboardInterrupt:
-        log.info("")
-        log.success("Monitor closed.")
-    except Exception as e:
-        log.error(f"Serial error on {port}: {e}")
-        raise SystemExit(1)
-
-
-def _serial_ports() -> List[str]:
-    """Serial devices that look like an attached development board."""
-    found: List[str] = []
-    for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/tty.usb*"):
-        found.extend(sorted(glob.glob(pattern)))
-    return found
+    log.header("ebuild — Environment")
+    for line in format_report(checks).splitlines():
+        click.echo(line)
+    raise SystemExit(exit_code(checks))
