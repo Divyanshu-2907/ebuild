@@ -24,6 +24,36 @@
   reported success. The rule now compiles with `-MMD -MF $out.d` and declares
   `depfile`/`deps`, so Ninja tracks the real include graph
   (`ebuild/build/ninja_backend.py`).
+- **Package registry: versions that are not purely numeric no longer raise.**
+  Version ordering parsed every dot-separated component with `int()`, so a
+  recipe declaring `v2.9.3` -- the upstream tag form `recipes/littlefs.yaml`
+  already downloads -- made `ebuild list-packages` fail with `ValueError`.
+  Prereleases (`3.6.0-rc1`), distribution revisions (`1.2.13-1`) and build
+  metadata (`1.0.0+build2`) failed the same way. It also replaced the
+  resolver's actionable "package not found" error, which enumerates the
+  registry, with a traceback. Dot-separated integers keep their numeric
+  ordering; anything else is ranked below every numeric version and ordered
+  lexicographically rather than guessed at (`ebuild/packages/registry.py`).
+- **Declared targets are no longer overridden by backend auto-detection.**
+  Backend detection inspects only the filesystem, so a `Makefile` kept for
+  `make flash`, or a `CMakeLists.txt` belonging to one subcomponent, won over
+  a `build.yaml` that declared its own `targets:`. The external tool ran, none
+  of the declared targets were built, no build directory was produced, and
+  `ebuild build` still reported "Build completed successfully" with exit code
+  0. When the backend was auto-detected and targets are declared, the ninja
+  backend is now used and the choice is logged. An explicit `backend:` in
+  `build.yaml` or `--backend` still takes precedence (`ebuild/cli/commands.py`).
+- **A relative `--build-dir` is now anchored to the project.** ebuild created
+  and reported the build directory relative to the process working directory,
+  while the ninja it launched read the same relative path from
+  `cfg.source_dir`. The two agree only when the working directory is the
+  project directory, so `ebuild build --config sub/build.yaml` failed with
+  "ninja: error: loading '_build/build.ninja': No such file or directory" one
+  line after reporting that it generated that file, and `ebuild configure`
+  reported success having written it where a later build would not look. A
+  relative `--build-dir` now resolves against the directory containing
+  `build.yaml`, as an absolute path, so both sides agree regardless of the
+  working directory (`ebuild/cli/commands.py`).
 
 ### Added
 - `ebuild.build.dispatch.UnknownBackendError`, raised for a backend a dispatch
