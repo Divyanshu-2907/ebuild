@@ -314,6 +314,28 @@ def _resolve_backend_request(
         resolved_backend = detect_backend(source_dir)
         log.info(f"Auto-detected backend: {resolved_backend}")
 
+        # A build.yaml that declares its own targets is a statement that
+        # ebuild builds this project. detect_backend() only inspects the
+        # filesystem, so a Makefile kept for `make flash` -- or a
+        # CMakeLists.txt belonging to one subcomponent -- used to outrank
+        # that statement: the dispatcher ran the external tool, the
+        # declared targets were never built, and the build still reported
+        # success.
+        #
+        # Only auto-detection is overridden. An explicit `backend:` in
+        # build.yaml or --backend on the command line still wins, which
+        # is how a project keeps both a target list and an external
+        # build.
+        if resolved_backend != "ninja" and cfg.targets:
+            log.info(
+                f"build.yaml declares {len(cfg.targets)} target(s), so "
+                f"the ninja backend is used instead of the detected "
+                f"{resolved_backend}. To build with {resolved_backend}, "
+                f"set 'backend: {resolved_backend}' in build.yaml or "
+                f"pass --backend {resolved_backend}."
+            )
+            resolved_backend = "ninja"
+
     return resolved_backend, backend_config
 
 

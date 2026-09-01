@@ -19,6 +19,15 @@
   registry, with a traceback. Dot-separated integers keep their numeric
   ordering; anything else is ranked below every numeric version and ordered
   lexicographically rather than guessed at (`ebuild/packages/registry.py`).
+- **Declared targets are no longer overridden by backend auto-detection.**
+  Backend detection inspects only the filesystem, so a `Makefile` kept for
+  `make flash`, or a `CMakeLists.txt` belonging to one subcomponent, won over
+  a `build.yaml` that declared its own `targets:`. The external tool ran, none
+  of the declared targets were built, no build directory was produced, and
+  `ebuild build` still reported "Build completed successfully" with exit code
+  0. When the backend was auto-detected and targets are declared, the ninja
+  backend is now used and the choice is logged. An explicit `backend:` in
+  `build.yaml` or `--backend` still takes precedence (`ebuild/cli/commands.py`).
 ## [3.0.1] - 2026-05-16
 
 ### Production Release — Unified EmbeddedOS-org v3.0.1
