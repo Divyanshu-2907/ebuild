@@ -13,7 +13,7 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,25 @@ TIER_2 = {"cmake", "meson"}
 TIER_3 = {"cargo"}
 
 ALL_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild", "ninja"}
+SUPPORTED_BACKENDS = TIER_1 | TIER_2 | TIER_3
+
+
+class BackendError(RuntimeError):
+    """Raised when the external dispatcher cannot handle a backend."""
+
+
+def _validate_backend(backend: str, supported: Set[str]) -> None:
+    """Reject values that the requested dispatcher operation cannot handle."""
+    if backend in supported:
+        return
+
+    if backend in ALL_BACKENDS:
+        message = f"BackendDispatcher cannot handle backend '{backend}'."
+    else:
+        message = f"Unknown build backend '{backend}'."
+
+    supported_names = ", ".join(sorted(supported))
+    raise BackendError(f"{message} Supported backends: {supported_names}.")
 
 #: Backends this dispatcher actually drives. "ninja" is ebuild's own backend --
 #: the CLI invokes NinjaBackend directly and never routes it through here.
@@ -141,8 +160,9 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            UnknownBackendError: If the backend is not one this dispatcher drives.
+            BackendError: If the backend cannot be configured here.
         """
+        _validate_backend(backend, SUPPORTED_BACKENDS)
         config = config or {}
         self.build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -165,9 +185,6 @@ class BackendDispatcher:
         elif backend in ("make", "kbuild"):
             pass  # No separate configure step
 
-        else:
-            raise _unknown_backend(backend, "configured")
-
     def build(
         self,
         backend: str,
@@ -183,8 +200,9 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            UnknownBackendError: If the backend is not one this dispatcher drives.
+            BackendError: If the backend cannot be built here.
         """
+        _validate_backend(backend, SUPPORTED_BACKENDS)
         config = config or {}
 
         if backend == "cmake":
@@ -213,9 +231,6 @@ class BackendDispatcher:
             cmd = ["make", "-C", str(self.source_dir)]
             _run_or_log(cmd, dry_run)
 
-        else:
-            raise _unknown_backend(backend, "built")
-
     def clean(
         self,
         backend: str,
@@ -229,8 +244,9 @@ class BackendDispatcher:
             dry_run: If True, log commands instead of executing them.
 
         Raises:
-            UnknownBackendError: If the backend is not one this dispatcher drives.
+            BackendError: If the backend cannot be cleaned here.
         """
+        _validate_backend(backend, ALL_BACKENDS)
         if backend == "cmake":
             _run_or_log(
                 ["cmake", "--build", str(self.build_dir), "--target", "clean"],
@@ -262,5 +278,3 @@ class BackendDispatcher:
                 dry_run,
                 check=False,
             )
-        else:
-            raise _unknown_backend(backend, "cleaned")
