@@ -47,6 +47,16 @@ class PackageFetcher:
         Raises:
             FetchError: If download or verification fails.
         """
+        # PackageRecipe.validate() rejects a recipe without a checksum, but
+        # fetch() is reachable with a hand-built recipe too, so refuse here as
+        # well rather than falling through to an unverified extract.
+        if not recipe.checksum:
+            raise FetchError(
+                f"Refusing to fetch {recipe.name} v{recipe.version}: the recipe "
+                f"carries no checksum, so there is nothing to verify the "
+                f"download against."
+            )
+
         archive_path = self._download(recipe)
         if recipe.checksum:
             try:
@@ -66,10 +76,10 @@ class PackageFetcher:
         """Download the source archive if not already cached."""
         if not recipe.url:
             raise FetchError(f"No URL specified for package {recipe.name}")
-        if not recipe.url.startswith(("http://", "https://")):
+        if not recipe.url.startswith("https://"):
             raise FetchError(
                 f"Invalid URL scheme for {recipe.name}: {recipe.url} "
-                f"(only http:// and https:// are allowed)"
+                f"(only https:// is allowed)"
             )
 
         archive_path = self._archive_path(recipe)

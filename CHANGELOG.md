@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- **`load_config`:** `toolchain.extra_cflags` and `toolchain.extra_ldflags` must be YAML lists of strings so scalar values cannot silently split into per-character compiler flags.
 - **Ninja backend: header changes now trigger a rebuild.** The generated `cc`
   rule declared no depfile, so Ninja only knew about the sources listed in
   `build.yaml`. Editing a header left stale object files in place and the build
