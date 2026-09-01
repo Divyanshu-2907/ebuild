@@ -66,6 +66,9 @@ class PackageCache:
         if not marker.exists():
             return False
 
+        if not self.install_dir(recipe).is_dir():
+            return False
+
         try:
             data = json.loads(marker.read_text(encoding="utf-8"))
             return (

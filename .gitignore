@@ -5,7 +5,9 @@ __pycache__/
 *.egg-info/
 *.egg
 dist/
-build/
+# Anchored: the bare pattern also matched ebuild/build/, the source package,
+# so any new module added there was silently untracked.
+/build/
 .eggs/
 *.whl
 
@@ -64,3 +66,4 @@ Desktop.ini
 build-*/
 node_modules/
 target/
+_build/

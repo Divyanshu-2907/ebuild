@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import re
+
 import yaml
 
 
@@ -39,6 +41,9 @@ class PackageRecipe:
 
     VALID_BUILD_SYSTEMS = ("cmake", "autoconf", "make", "meson", "custom")
 
+    #: A bare SHA-256 digest, with or without the "sha256:" prefix.
+    _SHA256_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")
+
     @property
     def slug(self) -> str:
         """Unique identifier: name-version."""
@@ -52,6 +57,31 @@ class PackageRecipe:
             raise RecipeError(f"Package '{self.name}' must have a 'version' field.")
         if not self.url:
             raise RecipeError(f"Package '{self.name}' must have a 'url' field.")
+
+        # A recipe with a checksum is a pin: a URL plus the digest of exactly
+        # what should be at it. The digest is not required here -- a recipe is
+        # also used to model packages that are never downloaded -- but a
+        # checksum that is present has to be a real one. "sha256:placeholder"
+        # parsed fine and then failed every single fetch with a mismatch, which
+        # is how two shipped recipes stayed unfetchable. PackageFetcher.fetch()
+        # separately refuses to download anything with no checksum at all.
+        if self.checksum and not self._SHA256_RE.match(self.checksum):
+            raise RecipeError(
+                f"Package '{self.name}': checksum '{self.checksum}' is not a "
+                f"sha256 digest. Expected 64 hex characters, optionally "
+                f"prefixed with 'sha256:'. Placeholder values are rejected — "
+                f"they turn every fetch of this package into a checksum "
+                f"mismatch."
+            )
+
+        # Plaintext HTTP defeats the pin's purpose in the common case where a
+        # recipe is edited without recomputing the digest, and it leaks what is
+        # being built. Every shipped recipe already uses https.
+        if self.url.startswith("http://"):
+            raise RecipeError(
+                f"Package '{self.name}': plaintext http:// is not accepted for "
+                f"'{self.url}'. Use https://."
+            )
         if self.build_system not in self.VALID_BUILD_SYSTEMS:
             raise RecipeError(
                 f"Package '{self.name}': invalid build system '{self.build_system}'. "

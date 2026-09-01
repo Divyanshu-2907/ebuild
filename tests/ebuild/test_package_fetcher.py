@@ -10,6 +10,7 @@ extracted from the wrong archive carries the wrong marker.
 """
 
 import hashlib
+import gzip
 import io
 import tarfile
 
@@ -29,24 +30,56 @@ LWIP_220_URL = "https://example.org/lwip/releases/2.2.0/source.tar.gz"
 LWIP_230_URL = "https://example.org/lwip/releases/2.3.0/source.tar.gz"
 
 
-def make_recipe(name, version="2.9.3", url=None, checksum=""):
+#: Placeholder digest for tests that never reach checksum verification (bad
+#: URL, unsupported format). Real-looking so it passes recipe validation.
+DUMMY_SHA256 = "sha256:" + "a" * 64
+
+
+def make_recipe(name, version="2.9.3", url=None, checksum=None):
+    """Build a recipe.
+
+    ``checksum`` defaults to the digest of the archive ``fake_download``
+    serves for ``url``, so tests about caching and extraction get past
+    verification. Pass an explicit value to exercise the checksum paths, or
+    ``""`` to exercise a recipe with no pin at all.
+    """
+    resolved_url = url if url is not None else LITTLEFS_URL
+    if checksum is None:
+        try:
+            checksum = "sha256:" + sha256_of(targz_bytes(resolved_url))
+        except Exception:
+            checksum = DUMMY_SHA256
     return PackageRecipe(
         name=name,
         version=version,
-        url=url if url is not None else LITTLEFS_URL,
+        url=resolved_url,
         checksum=checksum,
     )
 
 
 def targz_bytes(marker):
-    """A valid .tar.gz containing a single file whose body is *marker*."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    """A valid .tar.gz containing a single file whose body is *marker*.
+
+    Byte-for-byte reproducible. Both the tar header and the gzip header carry a
+    timestamp, and the defaults are "now" -- so two calls with the same marker
+    produced different bytes, and therefore different SHA-256, if they landed on
+    opposite sides of a second boundary. That made every checksum derived from
+    this helper a coin flip: the digest computed for the recipe had to match the
+    bytes handed out by fake_download later. It held on fast Linux runners and
+    failed on Windows. Pinning both timestamps to 0 removes the race.
+    """
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
         data = marker.encode("utf-8")
         info = tarfile.TarInfo("pkg/marker.txt")
         info.size = len(data)
+        info.mtime = 0
         tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
+
+    out = io.BytesIO()
+    with gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as gz:
+        gz.write(raw.getvalue())
+    return out.getvalue()
 
 
 def sha256_of(data):
@@ -181,12 +214,29 @@ def test_bare_checksum_without_sha256_prefix_is_accepted(tmp_path, fake_download
     assert marker_in(tmp_path / "src") == LITTLEFS_URL
 
 
-def test_empty_checksum_skips_verification(tmp_path, fake_download):
+def test_recipe_without_a_checksum_is_refused(tmp_path, fake_download):
+    """A recipe with no checksum used to be fetched and extracted unverified.
+
+    The URL alone is "whatever that host serves today". Refusing is the only
+    honest outcome: there is nothing to check the download against.
+    """
     fetcher = PackageFetcher(tmp_path / "dl")
 
-    fetcher.fetch(make_recipe("littlefs", checksum=""), tmp_path / "src")
+    with pytest.raises(FetchError, match="no checksum"):
+        fetcher.fetch(make_recipe("littlefs", checksum=""), tmp_path / "src")
 
-    assert marker_in(tmp_path / "src") == LITTLEFS_URL
+    # And nothing was downloaded or extracted on the way to that refusal.
+    assert not (tmp_path / "src").exists()
+
+
+def test_plaintext_http_is_refused(tmp_path, fake_download):
+    """https only: a pin is worth much less over a transport anyone can rewrite."""
+    fetcher = PackageFetcher(tmp_path / "dl")
+    recipe = make_recipe("littlefs", url="http://example.org/lib.tar.gz",
+                         checksum=DUMMY_SHA256)
+
+    with pytest.raises(FetchError, match="https"):
+        fetcher.fetch(recipe, tmp_path / "src")
 
 
 # ── Extraction ───────────────────────────────────────────────
@@ -207,7 +257,13 @@ def test_unsupported_archive_format_is_rejected(tmp_path, monkeypatch):
         lambda url, filename: open(filename, "wb").write(b"not an archive"),
     )
     fetcher = PackageFetcher(tmp_path / "dl")
-    recipe = make_recipe("littlefs", url="https://example.org/littlefs/v2.9.3.rar")
+    # Checksum of the bytes the patched urlretrieve writes, so the fetch gets
+    # past verification and reaches the format check this test is about.
+    recipe = make_recipe(
+        "littlefs",
+        url="https://example.org/littlefs/v2.9.3.rar",
+        checksum="sha256:6bbf954ab0045bc546f16a6db16c95afef820dccd807348411ea924dabb972e9",
+    )
 
     with pytest.raises(FetchError, match="Unsupported archive format"):
         fetcher.fetch(recipe, tmp_path / "src")

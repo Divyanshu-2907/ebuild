@@ -26,6 +26,7 @@ import yaml
 from ebuild import __version__
 from ebuild.build.ninja_backend import NinjaBackend, PackagePaths
 from ebuild.build.toolchain import resolve_toolchain
+from ebuild.cli.integration import register_commands as _register_integration_commands
 from ebuild.cli.logger import Logger
 from ebuild.core.config import ConfigError, load_config, ProjectConfig
 from ebuild.core.graph import CycleError, DependencyGraph, build_dependency_graph
@@ -207,6 +208,53 @@ def _detect_libraries(lib_dir: Path, pkg_name: str) -> List[str]:
     return libs if libs else [pkg_name]
 
 
+def _resolve_build_dir(build_dir: str, cfg: ProjectConfig) -> Path:
+    """Anchor a relative ``--build-dir`` to the project, not the cwd.
+
+    ``build.yaml`` describes the project, so ``_build`` means "beside
+    build.yaml" -- which is what the committed examples show
+    (``examples/hello_world/_build/``), what README and demo.md walk
+    through, and what the generated files already assume: ninja is invoked
+    with ``cwd=cfg.source_dir``, and compile_commands.json records
+    ``directory`` as the source directory with build-dir-relative outputs.
+
+    Only the Python side disagreed. It created and reported the build
+    directory relative to the *process* cwd, so the two bases coincided
+    exactly when the cwd was the project directory -- the documented golden
+    path, and the only case the examples exercise. With ``--config`` naming
+    a project elsewhere they diverged: `build` wrote build.ninja where the
+    ninja it then launched could not open it, and `configure` reported
+    success having written it somewhere a later build would not look.
+
+    The result is absolute. A path relative to the project would still be
+    re-interpreted by ninja, which runs in ``cfg.source_dir``: a relative
+    ``--config myproj/build.yaml`` yields ``myproj/_build``, and ninja
+    would then look for ``myproj/myproj/_build/build.ninja``. Absolute is
+    the only form that means the same thing to the process creating the
+    directory and to the ninja that reads what was written into it, and it
+    keeps the generated build.ninja independent of the cwd it was
+    generated from.
+    """
+    path = Path(build_dir)
+    if not path.is_absolute():
+        path = cfg.source_dir / path
+    return path.resolve()
+
+
+def _shown(path: Path) -> str:
+    """*path* as the user would type it: relative to the cwd when it is under it.
+
+    Build directories are resolved to absolute paths so that ninja and the
+    process agree on them, but printing an absolute path for the ordinary
+    in-project build would replace the "_build/build.ninja" that demo.md
+    documents with a machine-specific one.
+    """
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
+
+
 def _resolve_backend_request(
     cfg: ProjectConfig,
     backend_override: Optional[str],
@@ -223,6 +271,28 @@ def _resolve_backend_request(
         resolved_backend = detect_backend(source_dir)
         log.info(f"Auto-detected backend: {resolved_backend}")
 
+        # A build.yaml that declares its own targets is a statement that
+        # ebuild builds this project. detect_backend() only inspects the
+        # filesystem, so a Makefile kept for `make flash` -- or a
+        # CMakeLists.txt belonging to one subcomponent -- used to outrank
+        # that statement: the dispatcher ran the external tool, the
+        # declared targets were never built, and the build still reported
+        # success.
+        #
+        # Only auto-detection is overridden. An explicit `backend:` in
+        # build.yaml or --backend on the command line still wins, which
+        # is how a project keeps both a target list and an external
+        # build.
+        if resolved_backend != "ninja" and cfg.targets:
+            log.info(
+                f"build.yaml declares {len(cfg.targets)} target(s), so "
+                f"the ninja backend is used instead of the detected "
+                f"{resolved_backend}. To build with {resolved_backend}, "
+                f"set 'backend: {resolved_backend}' in build.yaml or "
+                f"pass --backend {resolved_backend}."
+            )
+            resolved_backend = "ninja"
+
     return resolved_backend, backend_config
 
 
@@ -230,20 +300,31 @@ def _configure_ninja_backend(
     cfg: ProjectConfig,
     build_path: Path,
     log: Logger,
+    *,
+    suggest_build: bool = True,
 ) -> None:
-    """Generate native ebuild Ninja files for configure-only workflows."""
+    """Generate native ebuild Ninja files for configure-only workflows.
+
+    The package paths are merged exactly as `ebuild build` merges them. If
+    they were not, `configure` and `build` would each write a different
+    build.ninja to the same path, and a developer who ran `configure` and then
+    invoked ninja directly would build without the cached-repo include and
+    library paths.
+    """
     log.step("Resolving toolchain...")
     compiler = resolve_toolchain(cfg.toolchain)
 
-    package_paths = _install_packages(cfg, build_path, log, verbose=log.verbose)
+    package_paths = {**_workspace_repo_paths(),
+                     **_install_packages(cfg, build_path, log, verbose=log.verbose)}
 
-    log.step(f"Generating build.ninja in {build_path}/...")
+    log.step(f"Generating build.ninja in {_shown(build_path)}/...")
     ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
     ninja_backend.generate()
 
-    log.success(f"Generated {build_path / 'build.ninja'}")
-    log.success(f"Generated {build_path / 'compile_commands.json'}")
-    log.info("Run 'ebuild build' to compile.")
+    log.success(f"Generated {_shown(build_path / 'build.ninja')}")
+    log.success(f"Generated {_shown(build_path / 'compile_commands.json')}")
+    if suggest_build:
+        log.info("Run 'ebuild build' to compile.")
 
 
 def _configure_external_backend(
@@ -631,7 +712,7 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         cfg = load_config(config_path)
         log.info(f"Project: {cfg.name} v{cfg.version}")
 
-        build_path = Path(build_dir)
+        build_path = _resolve_build_dir(build_dir, cfg)
         resolved_backend, backend_config = _resolve_backend_request(
             cfg=cfg,
             backend_override=backend,
@@ -680,11 +761,11 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
         # Install packages if any are declared
         package_paths = _install_packages(cfg, build_path, log, verbose=log.verbose, jobs=jobs)
 
-        log.step(f"Generating build.ninja in {build_path}/...")
+        log.step(f"Generating build.ninja in {_shown(build_path)}/...")
         ninja_backend = NinjaBackend(cfg, build_path, compiler, package_paths=package_paths)
         ninja_backend.generate()
-        log.success(f"Generated {build_path / 'build.ninja'}")
-        log.success(f"Generated {build_path / 'compile_commands.json'}")
+        log.success(f"Generated {_shown(build_path / 'build.ninja')}")
+        log.success(f"Generated {_shown(build_path / 'compile_commands.json')}")
 
         log.step("Invoking ninja...")
         ninja_cmd = [sys.executable, "-m", "ninja", "-f", str(build_path / "build.ninja")]
@@ -708,6 +789,8 @@ def build(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
             raise SystemExit(1)
 
         log.success("Build completed successfully.")
+        _build_summary(cfg, compiler, package_paths, log)
+        _report_footprint(cfg, build_path, log)
 
     except FileNotFoundError as e:
         log.error(_format_missing_tool(e))
@@ -865,17 +948,27 @@ def clean(log: Logger, build_dir: str) -> None:
     type=click.Choice(["auto", "cmake", "make", "meson", "cargo", "ninja", "kbuild"]),
     help="Force a specific build backend.",
 )
+@click.option(
+    "--board",
+    default=None,
+    help="Target board name (e.g., stm32f4, nrf52). Recorded in the project "
+         "config so later `ebuild build` / `flash` / `monitor` use it.",
+)
 @click.pass_obj
-def configure(log: Logger, config_path: str, build_dir: str, backend: Optional[str]) -> None:
+def configure(log: Logger, config_path: str, build_dir: str, backend: Optional[str],
+              board: Optional[str]) -> None:
     """Generate build files without building."""
     log.header("ebuild — Configure")
 
     try:
+        if board:
+            _record_board_selection(board, log)
+
         log.step("Loading configuration...")
         cfg = load_config(config_path)
         log.info(f"Project: {cfg.name} v{cfg.version}")
 
-        build_path = Path(build_dir)
+        build_path = _resolve_build_dir(build_dir, cfg)
         resolved_backend, backend_config = _resolve_backend_request(
             cfg=cfg,
             backend_override=backend,
@@ -997,7 +1090,7 @@ def install(log: Logger, config_path: str, build_dir: str) -> None:
             log.info("No packages declared in build.yaml.")
             return
 
-        build_path = Path(build_dir)
+        build_path = _resolve_build_dir(build_dir, cfg)
         _install_packages(cfg, build_path, log, verbose=log.verbose)
         log.success("All packages installed successfully.")
 
@@ -1012,6 +1105,33 @@ def install(log: Logger, config_path: str, build_dir: str) -> None:
         raise SystemExit(1)
 
 
+def _no_recipe_message(name: str, registry) -> str:
+    """Say what is available, and what the developer probably meant.
+
+    "No recipe found" on its own leaves them guessing at the spelling, at
+    whether the package exists under another name, and at where recipes even
+    come from.
+    """
+    import difflib
+
+    try:
+        available = sorted({r.name for r in registry.list_packages()})
+    except Exception:
+        available = []
+
+    lines = [f"No recipe for '{name}'."]
+    close = difflib.get_close_matches(name, available, n=3, cutoff=0.6)
+    if close:
+        lines.append("  Did you mean: " + ", ".join(close) + "?")
+    if available:
+        lines.append("  Available: " + ", ".join(available))
+    else:
+        lines.append("  No recipes are visible from here — is this a project "
+                     "directory with a recipes/ folder?")
+    lines.append(f"  To add it anyway: ebuild add {name} --force")
+    return "\n".join(lines)
+
+
 @cli.command("add")
 @click.argument("package_name")
 @click.option("--version", "pkg_version", default=None, help="Package version to add.")
@@ -1021,8 +1141,13 @@ def install(log: Logger, config_path: str, build_dir: str) -> None:
     type=click.Path(exists=False),
     help="Path to the build configuration file.",
 )
+@click.option(
+    "--force", is_flag=True, default=False,
+    help="Add a package with no recipe. It will not resolve until one exists.",
+)
 @click.pass_obj
-def add_package(log: Logger, package_name: str, pkg_version: Optional[str], config_path: str) -> None:
+def add_package(log: Logger, package_name: str, pkg_version: Optional[str],
+                config_path: str, force: bool) -> None:
     """Add a package dependency to build.yaml."""
     log.header("ebuild — Add Package")
 
@@ -1040,8 +1165,17 @@ def add_package(log: Logger, package_name: str, pkg_version: Optional[str], conf
             log.info(f"Found recipe: {recipe.name} v{recipe.version}")
             if pkg_version is None:
                 pkg_version = recipe.version
+        elif not force:
+            # Writing an entry that cannot resolve trades one clear error now
+            # for a confusing one at build time, in a file the developer has
+            # since committed.
+            log.error(_no_recipe_message(package_name, registry))
+            raise SystemExit(1)
         else:
-            log.warning(f"No recipe found for '{package_name}' — adding anyway.")
+            log.warning(
+                f"No recipe found for '{package_name}' — added because "
+                f"--force was given. It will not resolve until a recipe exists."
+            )
 
     # Load and update config
     with open(config_path_obj, "r", encoding="utf-8") as f:
@@ -1977,3 +2111,272 @@ def generate_board(
     except Exception as e:
         log.error(f"Board generation failed: {e}")
         raise SystemExit(1)
+
+
+@cli.command()
+@click.option(
+    "--config",
+    "config_path",
+    default="build.yaml",
+    type=click.Path(),
+    help="Path to the build configuration file.",
+)
+@click.option(
+    "--build-dir",
+    default="_build",
+    type=click.Path(),
+    help="Build output directory.",
+)
+@click.option(
+    "--filter",
+    "name_filter",
+    default=None,
+    help="Only run tests whose name contains this substring.",
+)
+@click.pass_obj
+def test(log: Logger, config_path: str, build_dir: str,
+         name_filter: Optional[str]) -> None:
+    """Build and run the project's tests.
+
+    Step six of the golden path. Delegates to whichever runner the project
+    already uses -- ctest for a CMake tree, `cargo test`, `meson test`, or
+    `make test` -- rather than imposing a test framework on the project.
+    """
+    log.header("ebuild — Test")
+
+    build_path = Path(build_dir)
+
+    try:
+        log.step("Loading configuration...")
+        cfg = load_config(config_path)
+        log.info(f"Project: {cfg.name} v{cfg.version}")
+    except FileNotFoundError:
+        log.error(
+            f"No {config_path} here. Run this from a project directory, or "
+            f"pass --config."
+        )
+        raise SystemExit(1)
+    except (ConfigError, RecipeError) as e:
+        log.error(f"Configuration error: {e}")
+        raise SystemExit(1)
+
+    native = [t for t in cfg.targets if t.target_type == "test"]
+    if native:
+        _run_native_tests(cfg, native, build_path, log, name_filter)
+        return
+
+    runner = _resolve_test_runner(cfg.source_dir, build_path, name_filter)
+    if runner is None:
+        log.error(
+            "No test runner found for this project.\n"
+            "  ebuild test drives the project's own runner. Add one of:\n"
+            "    - CMake with enable_testing() + add_test()   -> ctest\n"
+            "    - a 'test' target in the Makefile            -> make test\n"
+            "    - Cargo.toml                                 -> cargo test\n"
+            "    - meson.build                                -> meson test"
+        )
+        raise SystemExit(1)
+
+    name, argv, cwd = runner
+    log.step(f"Running tests with {name}...")
+    log.info(" ".join(argv))
+
+    try:
+        result = subprocess.run(argv, cwd=str(cwd))
+    except FileNotFoundError:
+        log.error(
+            f"{name} is not installed or not on PATH, so the tests cannot be "
+            f"run here."
+        )
+        raise SystemExit(1)
+
+    if result.returncode != 0:
+        log.error(f"Tests failed ({name} exited {result.returncode}).")
+        raise SystemExit(result.returncode)
+
+    log.success("All tests passed.")
+
+
+def _run_native_tests(
+    cfg: "ProjectConfig",
+    targets: List[Any],
+    build_path: Path,
+    log: Logger,
+    name_filter: Optional[str],
+) -> None:
+    """Build and run the project's own ``test`` targets.
+
+    A scaffolded project has no CMake tree and no Makefile, so there is no
+    external runner to delegate to. The test binaries are ordinary ebuild
+    targets; build them the same way `ebuild build` does, then run each one
+    and treat a non-zero exit as a failure.
+    """
+    selected = [t for t in targets if not name_filter or name_filter in t.name]
+    if not selected:
+        log.error(f"No test target matches --filter {name_filter!r}.")
+        raise SystemExit(1)
+
+    log.step("Building test targets...")
+    _configure_ninja_backend(cfg, build_path, log, suggest_build=False)
+
+    from ebuild.build.dispatch import ninja_command
+
+    # Ninja addresses targets by their output path, and `ebuild build` drives
+    # it with -f from the project root, so the same form is used here.
+    argv = (
+        ninja_command()
+        + ["-f", str(build_path / "build.ninja")]
+        + [str(build_path / t.name) for t in selected]
+    )
+    result = subprocess.run(argv)
+    if result.returncode != 0:
+        log.error("Test targets failed to build.")
+        raise SystemExit(result.returncode)
+
+    failures: List[str] = []
+    for target in selected:
+        binary = build_path / target.name
+        if not binary.is_file():
+            log.error(f"{target.name}: built, but no binary at {binary}")
+            failures.append(target.name)
+            continue
+
+        log.step(f"Running {target.name}...")
+        run = subprocess.run([str(binary)])
+        if run.returncode == 0:
+            log.success(f"  {target.name}: passed")
+        else:
+            log.error(f"  {target.name}: exited {run.returncode}")
+            failures.append(target.name)
+
+    if failures:
+        log.error(f"{len(failures)} of {len(selected)} test targets failed: "
+                  + ", ".join(failures))
+        raise SystemExit(1)
+
+    log.success(f"All {len(selected)} test targets passed.")
+
+
+def _resolve_test_runner(
+    source_dir: Path,
+    build_dir: Path,
+    name_filter: Optional[str],
+) -> Optional[Tuple[str, List[str], Path]]:
+    """Pick the test runner this project already uses.
+
+    Returns ``(display_name, argv, cwd)``, or None when the project declares
+    no tests. Ordered so that an explicit CMake test registry wins over a
+    generic `make test` target in the same tree.
+    """
+    if (build_dir / "CTestTestfile.cmake").is_file():
+        argv = ["ctest", "--output-on-failure"]
+        if name_filter:
+            argv += ["-R", name_filter]
+        return "ctest", argv, build_dir
+
+    if (source_dir / "Cargo.toml").is_file():
+        argv = ["cargo", "test"]
+        if name_filter:
+            argv += [name_filter]
+        return "cargo test", argv, source_dir
+
+    if (build_dir / "meson-info").is_dir():
+        argv = ["meson", "test", "-C", str(build_dir)]
+        if name_filter:
+            argv += ["--suite", name_filter]
+        return "meson test", argv, source_dir
+
+    makefile = next(
+        (source_dir / n for n in ("Makefile", "makefile", "GNUmakefile")
+         if (source_dir / n).is_file()),
+        None,
+    )
+    if makefile is not None:
+        text = makefile.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"^test\s*:", text, re.MULTILINE):
+            return "make test", ["make", "-C", str(source_dir), "test"], source_dir
+
+    return None
+
+
+@cli.command()
+@click.option("--port", default=None,
+              help="Serial device (e.g. /dev/ttyUSB0). Auto-detected if omitted.")
+@click.option("--baud", default=115200, type=int, help="Baud rate.")
+@click.pass_obj
+def monitor(log: Logger, port: Optional[str], baud: int) -> None:
+    """Attach a serial monitor to the target device.
+
+    Step eight of the golden path -- the step that shows a developer their
+    first firmware run actually produced output.
+    """
+    log.header("ebuild — Monitor")
+    log.info(f"Board: {_selected_board()}")
+
+    if port is None:
+        candidates = _serial_ports()
+        if not candidates:
+            log.error(
+                "No serial device found.\n"
+                "  Looked for /dev/ttyUSB*, /dev/ttyACM*, /dev/tty.usb*.\n"
+                "  Connect the board, or name the device with --port."
+            )
+            raise SystemExit(1)
+        if len(candidates) > 1:
+            log.error(
+                "More than one serial device is connected, so ebuild will not "
+                "guess which one is the board:\n"
+                + "\n".join(f"    {c}" for c in candidates)
+                + "\n  Choose one with --port."
+            )
+            raise SystemExit(1)
+        port = candidates[0]
+        log.info(f"Auto-detected {port}")
+
+    log.step(f"Opening {port} at {baud} baud... (Ctrl-C to exit)")
+
+    try:
+        import serial  # type: ignore[import-untyped]
+    except ImportError:
+        log.error(
+            "pyserial is not installed, so the monitor cannot open the port.\n"
+            "  Install it with:  pip install pyserial"
+        )
+        raise SystemExit(1)
+
+    try:
+        with serial.Serial(port, baud, timeout=0.2) as conn:
+            while True:
+                chunk = conn.read(4096)
+                if chunk:
+                    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+    except KeyboardInterrupt:
+        log.info("")
+        log.success("Monitor closed.")
+    except Exception as e:
+        log.error(f"Serial error on {port}: {e}")
+        raise SystemExit(1)
+
+
+def _serial_ports() -> List[str]:
+    """Serial devices that look like an attached development board."""
+    found: List[str] = []
+    for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/tty.usb*"):
+        found.extend(sorted(glob.glob(pattern)))
+    return found
+
+
+# ═════════════════════════════════════════════════════════════
+#  Integration commands
+# ═════════════════════════════════════════════════════════════
+# `integration`, `qemu`, `sdk`, `package` and `models` live in
+# ebuild/cli/integration.py and are attached to the group by
+# register_commands(). That call used to live only in ebuild/__main__.py,
+# which runs for `python -m ebuild` and not for the `ebuild` console script
+# that pyproject.toml's [project.scripts] installs on PATH. The five
+# commands were therefore missing from the entry point that every user and
+# every doc actually invokes. Registering here attaches them to the group
+# itself, so both entry points -- and anything that imports `cli` -- see
+# the same CLI.
+_register_integration_commands(cli)
