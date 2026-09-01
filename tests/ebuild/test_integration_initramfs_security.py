@@ -21,7 +21,9 @@ shell ever getting a chance to reinterpret it.
 """
 
 import gzip
+import os
 import shutil
+import stat
 import subprocess
 
 import pytest
@@ -40,6 +42,44 @@ requires_cpio = pytest.mark.skipif(
 
 
 @requires_cpio
+def _newc_members(data):
+    """Parse enough of ``newc`` to validate names, metadata, and contents."""
+    members = {}
+    offset = 0
+    while True:
+        header = data[offset:offset + 110]
+        assert len(header) == 110
+        assert header[:6] == b"070701"
+        fields = [int(header[i:i + 8], 16) for i in range(6, 110, 8)]
+        inode = fields[0]
+        mode = fields[1]
+        link_count = fields[4]
+        file_size = fields[6]
+        name_size = fields[11]
+
+        offset += 110
+        encoded_name = data[offset:offset + name_size]
+        assert encoded_name.endswith(b"\0")
+        name = os.fsdecode(encoded_name[:-1])
+        offset += name_size
+        offset += -offset % 4
+
+        contents = data[offset:offset + file_size]
+        assert len(contents) == file_size
+        offset += file_size
+        offset += -offset % 4
+        members[name] = {
+            "inode": inode,
+            "mode": mode,
+            "link_count": link_count,
+            "contents": contents,
+        }
+
+        if name == "TRAILER!!!":
+            return members
+
+
+
 def test_create_initramfs_produces_valid_gzip_with_expected_content(tmp_path):
     """Functional regression: the pipeline must still work correctly."""
     rootfs = tmp_path / "rootfs"
