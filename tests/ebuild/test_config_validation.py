@@ -98,28 +98,67 @@ def test_toolchain_mapping_is_parsed(tmp_path):
     assert config.toolchain.extra_ldflags == ["--specs=nosys.specs"]
 
 
-@pytest.mark.parametrize("field_name", ["extra_cflags", "extra_ldflags"])
-def test_toolchain_flag_fields_must_be_lists(tmp_path, field_name):
+@pytest.mark.parametrize("invalid_packages", [
+    {"name": "zlib", "version": "1.2.13"},
+    "zlib",
+    42,
+])
+def test_packages_must_be_a_list(tmp_path, invalid_packages):
+    path = write_config(
+        tmp_path,
+        {"project": {"name": "demo"}, "packages": invalid_packages},
+    )
+
+    with pytest.raises(ConfigError, match="'packages' must be a list"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("invalid_item", ["zlib", 42, None])
+def test_package_definition_must_be_mapping(tmp_path, invalid_item):
+    path = write_config(
+        tmp_path,
+        {"project": {"name": "demo"}, "packages": [invalid_item]},
+    )
+
+    with pytest.raises(ConfigError, match="expected a YAML mapping"):
+        load_config(path)
+
+
+def test_package_definition_requires_name(tmp_path):
     path = write_config(
         tmp_path,
         {
             "project": {"name": "demo"},
-            "toolchain": {field_name: "-O2"},
+            "packages": [{"version": "1.2.13"}],
         },
     )
 
-    with pytest.raises(ConfigError, match=rf"field '{field_name}' must be a list"):
+    with pytest.raises(ConfigError, match="must have a 'name'"):
         load_config(path)
 
 
-def test_toolchain_flag_items_must_be_strings(tmp_path):
+def test_packages_list_is_parsed(tmp_path):
     path = write_config(
         tmp_path,
         {
             "project": {"name": "demo"},
-            "toolchain": {"extra_cflags": ["-O2", 42]},
+            "packages": [
+                {"name": "zlib", "version": "1.2.13"},
+                {"name": "mbedtls"},
+            ],
         },
     )
 
-    with pytest.raises(ConfigError, match="extra_cflags.*must contain only strings"):
-        load_config(path)
+    config = load_config(path)
+
+    assert len(config.packages) == 2
+    assert config.packages[0].name == "zlib"
+    assert config.packages[0].version == "1.2.13"
+    assert config.packages[1].name == "mbedtls"
+    assert config.packages[1].version is None
+
+
+def test_omitted_packages_is_empty(tmp_path):
+    path = write_config(tmp_path, {"project": {"name": "demo"}})
+    config = load_config(path)
+    assert config.packages == []

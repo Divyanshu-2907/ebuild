@@ -305,18 +305,25 @@ def load_config(config_path: str | Path) -> ProjectConfig:
 
     # --- packages section (optional, Phase 2) ---
     packages: List[PackageDep] = []
-    raw_packages = raw.get("packages", [])
-
-    if isinstance(raw_packages, list):
-        for p in raw_packages:
-            if isinstance(p, dict):
-                pkg_name = p.get("name", "")
-                pkg_version = p.get("version")
-
-                if pkg_name:
-                    packages.append(
-                        PackageDep(name=pkg_name, version=pkg_version)
-                    )
+    if "packages" in raw:
+        raw_packages = raw["packages"]
+        if not isinstance(raw_packages, list):
+            raise ConfigError(
+                "'packages' must be a list of package definitions."
+            )
+        for pkg in raw_packages:
+            if not isinstance(pkg, dict):
+                raise ConfigError(
+                    "Invalid package definition: expected a YAML mapping, "
+                    f"got {type(pkg).__name__}."
+                )
+            pkg_name = pkg.get("name", "")
+            pkg_version = pkg.get("version")
+            if not pkg_name:
+                raise ConfigError("Package definition must have a 'name' field.")
+            if pkg_version is not None and not isinstance(pkg_version, str):
+                pkg_version = str(pkg_version)
+            packages.append(PackageDep(name=pkg_name, version=pkg_version))
 
     return ProjectConfig(
         name=project_name,

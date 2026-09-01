@@ -21,51 +21,25 @@ shell ever getting a chance to reinterpret it.
 """
 
 import gzip
-import os
-import stat
+import shutil
+import subprocess
 
 import pytest
 
 from ebuild.cli.integration import _create_initramfs
 
-
-def _newc_members(data):
-    """Parse enough of ``newc`` to validate names, metadata, and contents."""
-    members = {}
-    offset = 0
-    while True:
-        header = data[offset:offset + 110]
-        assert len(header) == 110
-        assert header[:6] == b"070701"
-        fields = [int(header[i:i + 8], 16) for i in range(6, 110, 8)]
-        inode = fields[0]
-        mode = fields[1]
-        link_count = fields[4]
-        file_size = fields[6]
-        name_size = fields[11]
-
-        offset += 110
-        encoded_name = data[offset:offset + name_size]
-        assert encoded_name.endswith(b"\0")
-        name = os.fsdecode(encoded_name[:-1])
-        offset += name_size
-        offset += -offset % 4
-
-        contents = data[offset:offset + file_size]
-        assert len(contents) == file_size
-        offset += file_size
-        offset += -offset % 4
-        members[name] = {
-            "inode": inode,
-            "mode": mode,
-            "link_count": link_count,
-            "contents": contents,
-        }
-
-        if name == "TRAILER!!!":
-            return members
+# _create_initramfs() drives find(1) and cpio(1) directly. Neither exists on a
+# stock Windows runner, so these fail with WinError 2 before reaching anything
+# they mean to test. Building a Linux initramfs is not a Windows operation;
+# skipping is the honest outcome, matching how test_ninja_backend.py skips when
+# no host C compiler is present.
+requires_cpio = pytest.mark.skipif(
+    shutil.which("cpio") is None or shutil.which("find") is None,
+    reason="find(1)/cpio(1) not available on this host",
+)
 
 
+@requires_cpio
 def test_create_initramfs_produces_valid_gzip_with_expected_content(tmp_path):
     """Functional regression: the pipeline must still work correctly."""
     rootfs = tmp_path / "rootfs"
@@ -94,6 +68,7 @@ def test_create_initramfs_produces_valid_gzip_with_expected_content(tmp_path):
     assert "TRAILER!!!" in members
 
 
+@requires_cpio
 def test_create_initramfs_build_dir_with_shell_metacharacters_is_not_interpreted(tmp_path):
     """A build_dir name containing shell syntax must be treated as a plain
     literal path component, never parsed as shell syntax. Pre-fix, a name
@@ -122,6 +97,7 @@ def test_create_initramfs_build_dir_with_shell_metacharacters_is_not_interpreted
     assert not (rootfs / "pwned_marker").exists()
 
 
+@requires_cpio
 def test_create_initramfs_rootfs_with_shell_metacharacters_is_not_interpreted(tmp_path):
     """Same check for the ``rootfs`` argument (the ``cd {rootfs}`` half of
     the old shell string)."""

@@ -27,7 +27,15 @@ def _shared_library_config(tmp_path, target_cflags=None):
     )
 
 
-def test_shared_library_uses_shared_link_rule(tmp_path):
+def test_shared_library_links_with_the_platform_shared_flag(tmp_path):
+    """A shared_library must link through the compiler driver with the
+    platform's shared-object flag.
+
+    An earlier revision emitted a dedicated `link_shared` rule hardcoding
+    `-shared`, which is wrong on macOS (it needs `-dynamiclib`) and skipped the
+    -L/-l wiring, so the rule was dropped in favour of the generic `link` rule
+    with the flag pushed into ldflags.
+    """
     config = ProjectConfig(
         name="shared-example",
         version="1.0.0",
@@ -45,9 +53,15 @@ def test_shared_library_uses_shared_link_rule(tmp_path):
     NinjaBackend(config, tmp_path / "build", toolchain).generate()
 
     ninja_file = (tmp_path / "build" / "build.ninja").read_text(encoding="utf-8")
-    assert "rule link_shared\n  command = $cc -shared" in ninja_file
-    assert "build " in ninja_file
-    assert ": link_shared " in ninja_file
+    shared_flag = "-dynamiclib" if sys.platform == "darwin" else "-shared"
+
+    lib_line = next(
+        line for line in ninja_file.splitlines()
+        if line.startswith("build ") and "libexample" in line
+    )
+    assert ": link " in lib_line
+    assert f"ldflags = {shared_flag}" in ninja_file
+    assert "link_shared" not in ninja_file
 
 
 def test_cc_rule_emits_and_consumes_a_depfile(tmp_path):
