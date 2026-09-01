@@ -26,6 +26,7 @@ import yaml
 from ebuild import __version__
 from ebuild.build.ninja_backend import NinjaBackend, PackagePaths
 from ebuild.build.toolchain import resolve_toolchain
+from ebuild.cli.integration import register_commands as _register_integration_commands
 from ebuild.cli.logger import Logger
 from ebuild.core.config import ConfigError, load_config, ProjectConfig
 from ebuild.core.graph import CycleError, DependencyGraph, build_dependency_graph
@@ -2143,6 +2144,8 @@ def test(log: Logger, config_path: str, build_dir: str,
     """
     log.header("ebuild — Test")
 
+    build_path = Path(build_dir)
+
     try:
         log.step("Loading configuration...")
         cfg = load_config(config_path)
@@ -2156,8 +2159,6 @@ def test(log: Logger, config_path: str, build_dir: str,
     except (ConfigError, RecipeError) as e:
         log.error(f"Configuration error: {e}")
         raise SystemExit(1)
-
-    build_path = _resolve_build_dir(build_dir, cfg)
 
     native = [t for t in cfg.targets if t.target_type == "test"]
     if native:
@@ -2227,9 +2228,7 @@ def _run_native_tests(
         + ["-f", str(build_path / "build.ninja")]
         + [str(build_path / t.name) for t in selected]
     )
-    # Run from the project directory, as `ebuild build` does: the source
-    # paths recorded in build.ninja are relative to it.
-    result = subprocess.run(argv, cwd=str(cfg.source_dir))
+    result = subprocess.run(argv)
     if result.returncode != 0:
         log.error("Test targets failed to build.")
         raise SystemExit(result.returncode)
@@ -2366,3 +2365,18 @@ def _serial_ports() -> List[str]:
     for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/tty.usb*"):
         found.extend(sorted(glob.glob(pattern)))
     return found
+
+
+# ═════════════════════════════════════════════════════════════
+#  Integration commands
+# ═════════════════════════════════════════════════════════════
+# `integration`, `qemu`, `sdk`, `package` and `models` live in
+# ebuild/cli/integration.py and are attached to the group by
+# register_commands(). That call used to live only in ebuild/__main__.py,
+# which runs for `python -m ebuild` and not for the `ebuild` console script
+# that pyproject.toml's [project.scripts] installs on PATH. The five
+# commands were therefore missing from the entry point that every user and
+# every doc actually invokes. Registering here attaches them to the group
+# itself, so both entry points -- and anything that imports `cli` -- see
+# the same CLI.
+_register_integration_commands(cli)
