@@ -14,7 +14,7 @@ import os
 import subprocess
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -29,6 +29,12 @@ from ebuild.deps import (
 
 # Known repo names
 KNOWN_REPOS = ("eos", "eboot")
+
+# Sibling directory names. GitHub and local checkouts often use eBoot.
+SIBLING_DIR_NAMES: Dict[str, Tuple[str, ...]] = {
+    "eos": ("eos",),
+    "eboot": ("eboot", "eBoot"),
+}
 
 # Environment variable names for path overrides
 ENV_PATH_VARS = {
@@ -46,7 +52,7 @@ class DepsManager:
     2. Environment variables ``EBUILD_EOS_PATH`` / ``EBUILD_EBOOT_PATH``
     3. ``~/.ebuild/config.yaml`` custom ``path:`` override
     4. ``~/.ebuild/repos/<name>/`` (cached git clone)
-    5. Sibling directory ``../<name>/`` (workspace layout)
+    5. Sibling directory ``../<name>/`` (workspace layout; ``eboot`` also tries ``eBoot``)
     6. Embedded ``core/<name>/`` (legacy fallback — prints deprecation warning)
     """
 
@@ -118,7 +124,7 @@ class DepsManager:
         Args:
             repo_name: ``"eos"`` or ``"eboot"``.
             url: Git URL override. Falls back to config → default.
-            branch: Branch/tag override. Falls back to config → ``"main"``.
+            branch: Branch/tag override. Falls back to config → ``"master"``.
             path: If given, register this local path instead of cloning.
             shallow: Use ``--depth 1`` for faster clones (default *True*).
 
@@ -143,7 +149,7 @@ class DepsManager:
 
         # Clone to cache
         effective_url = repo_cfg.get("url") or self._default_url(repo_name)
-        effective_branch = repo_cfg.get("branch") or "main"
+        effective_branch = repo_cfg.get("branch") or "master"
 
         dest = self.cache_dir / repo_name
         if dest.exists():
@@ -204,11 +210,13 @@ class DepsManager:
         if cached.is_dir():
             return cached
 
-        # 5. Sibling directory
+        # 5. Sibling directory (try documented aliases; Linux is case-sensitive)
         if project_dir:
-            sibling = project_dir.parent / repo_name
-            if sibling.is_dir():
-                return sibling
+            names = SIBLING_DIR_NAMES.get(repo_name, (repo_name,))
+            for name in names:
+                sibling = project_dir.parent / name
+                if sibling.is_dir():
+                    return sibling
 
         # 6. Legacy embedded core/<name>/ (deprecation warning)
         if project_dir:
@@ -279,7 +287,7 @@ class DepsManager:
             info: Dict[str, Any] = {
                 "name": name,
                 "url": repo_cfg.get("url", self._default_url(name)),
-                "branch": repo_cfg.get("branch", "main"),
+                "branch": repo_cfg.get("branch", "master"),
                 "config_path": repo_cfg.get("path"),
                 "cached": cached.is_dir(),
                 "cache_location": str(cached) if cached.is_dir() else None,
