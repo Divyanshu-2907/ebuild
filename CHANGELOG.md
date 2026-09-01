@@ -9,7 +9,16 @@
   reported success. The rule now compiles with `-MMD -MF $out.d` and declares
   `depfile`/`deps`, so Ninja tracks the real include graph
   (`ebuild/build/ninja_backend.py`).
-
+- **Package registry: versions that are not purely numeric no longer raise.**
+  Version ordering parsed every dot-separated component with `int()`, so a
+  recipe declaring `v2.9.3` -- the upstream tag form `recipes/littlefs.yaml`
+  already downloads -- made `ebuild list-packages` fail with `ValueError`.
+  Prereleases (`3.6.0-rc1`), distribution revisions (`1.2.13-1`) and build
+  metadata (`1.0.0+build2`) failed the same way. It also replaced the
+  resolver's actionable "package not found" error, which enumerates the
+  registry, with a traceback. Dot-separated integers keep their numeric
+  ordering; anything else is ranked below every numeric version and ordered
+  lexicographically rather than guessed at (`ebuild/packages/registry.py`).
 ## [3.0.1] - 2026-05-16
 
 ### Production Release — Unified EmbeddedOS-org v3.0.1

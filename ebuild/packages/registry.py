@@ -15,6 +15,32 @@ from typing import Dict, List, Optional
 from ebuild.packages.recipe import PackageRecipe, RecipeError, load_recipe
 
 
+def _version_sort_key(version: str) -> tuple:
+    """Ordering key for a recipe version string.
+
+    The recipe format documents no version grammar, and every bundled recipe
+    uses dot-separated integers (``1.3.1``, ``11.1.0``). That is the format
+    this registry orders: components are compared numerically, so ``1.10.0``
+    correctly sorts above ``1.9.0``.
+
+    Anything else -- a Debian revision (``1.2.13-1``), a prerelease
+    (``3.6.0-rc1``), a ``v``-prefixed upstream tag (``v2.9.3``) -- is outside
+    that format. Rather than guess at its ordering, such a version is ranked
+    below every numeric one and ordered lexicographically among its peers.
+    Ranking it below matters for ``get()``: with ``3.6.0`` and ``3.6.0-rc1``
+    both registered, the plain numeric release is chosen as latest.
+
+    Returning a key instead of raising keeps a single out-of-format recipe
+    from breaking commands that merely enumerate the registry -- including
+    the resolver's "package not found" message, which lists every known
+    package and so used to fail with ValueError instead of ResolveError.
+    """
+    parts = version.split(".")
+    if parts and all(part.isdigit() for part in parts):
+        return (1, tuple(int(part) for part in parts), "")
+    return (0, (), version)
+
+
 class PackageRegistry:
     """Registry of available package recipes.
 
@@ -74,7 +100,7 @@ class PackageRegistry:
         if version:
             return versions.get(version)
 
-        latest_version = sorted(versions.keys(), key=lambda v: [int(x) for x in v.split('.')])[-1]
+        latest_version = sorted(versions.keys(), key=_version_sort_key)[-1]
         return versions[latest_version]
 
     def has(self, name: str, version: Optional[str] = None) -> bool:
@@ -86,7 +112,7 @@ class PackageRegistry:
         result = []
         for name in sorted(self._recipes.keys()):
             versions = self._recipes[name]
-            latest = sorted(versions.keys(), key=lambda v: [int(x) for x in v.split('.')])[-1]
+            latest = sorted(versions.keys(), key=_version_sort_key)[-1]
             result.append(versions[latest])
         return result
 
@@ -97,7 +123,7 @@ class PackageRegistry:
                 versions[v]
                 for v in sorted(
                     versions.keys(),
-                    key=lambda v: [int(x) for x in v.split(".")],
+                    key=_version_sort_key,
                  )
               ]
 
