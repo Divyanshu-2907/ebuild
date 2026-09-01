@@ -9,10 +9,39 @@ package name and version.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ebuild.packages.recipe import PackageRecipe, RecipeError, load_recipe
+
+_LEADING_DIGITS = re.compile(r"(\d*)(.*)")
+
+
+def _component_key(component: str) -> Tuple[int, str]:
+    """Sort key for one dot-separated component of a version string.
+
+    Splits the leading digits from any trailing text so "11" sorts above "2"
+    numerically, and "11b" sorts just above "11".
+    """
+    digits, rest = _LEADING_DIGITS.match(component).groups()
+    return (int(digits) if digits else 0, rest)
+
+
+def version_key(version: str) -> Tuple[Tuple[Tuple[int, str], ...], bool, str]:
+    """Sort key for a version string, tolerant of non-numeric parts.
+
+    Real-world versions are not always all digits — "3.6.0-rc1", "1.2.11b" and
+    "2.9.3p1" all occur upstream. Comparing them numerically raises ValueError,
+    and comparing them as plain strings puts "11.1.0" below "2.9.3".
+
+    A pre-release suffix lowers precedence, so 3.6.0-rc1 sorts below 3.6.0.
+    """
+    release, _, pre_release = version.partition("-")
+    components = tuple(_component_key(c) for c in release.split("."))
+    # `not pre_release` is True for a final release, which sorts above any
+    # pre-release sharing the same components.
+    return (components, not pre_release, pre_release)
 
 
 class PackageRegistry:
@@ -74,7 +103,7 @@ class PackageRegistry:
         if version:
             return versions.get(version)
 
-        latest_version = sorted(versions.keys(), key=lambda v: [int(x) for x in v.split('.')])[-1]
+        latest_version = max(versions.keys(), key=version_key)
         return versions[latest_version]
 
     def has(self, name: str, version: Optional[str] = None) -> bool:
@@ -86,20 +115,14 @@ class PackageRegistry:
         result = []
         for name in sorted(self._recipes.keys()):
             versions = self._recipes[name]
-            latest = sorted(versions.keys(), key=lambda v: [int(x) for x in v.split('.')])[-1]
+            latest = max(versions.keys(), key=version_key)
             result.append(versions[latest])
         return result
 
     def list_all_versions(self, name: str) -> List[PackageRecipe]:
         """Return all versions of a package."""
         versions = self._recipes.get(name, {})
-        return [
-                versions[v]
-                for v in sorted(
-                    versions.keys(),
-                    key=lambda v: [int(x) for x in v.split(".")],
-                 )
-              ]
+        return [versions[v] for v in sorted(versions.keys(), key=version_key)]
 
     @property
     def package_count(self) -> int:
