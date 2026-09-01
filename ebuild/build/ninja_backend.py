@@ -9,6 +9,7 @@ Generates build.ninja and compile_commands.json from a ProjectConfig.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -180,7 +181,7 @@ class NinjaBackend:
                     lines.append(f"  cflags = {' '.join(cflags)}")
                 lines.append("")
 
-            if target.target_type == "executable":
+            if target.target_type in ("executable", "test"):
                 ldflags = toolchain_ldflags + list(target.ldflags)
                 libs = []
                 dep_archives = []
@@ -225,11 +226,11 @@ class NinjaBackend:
                         f"{' '.join(_ninja_path(o) for o in obj_files)}"
                     )
                 else:
-                    # Shared libraries need the platform's "build a shared
-                    # object" flag and the same -L/-l wiring executables get,
-                    # neither of which the generic `link` rule provides.
+                    # Shared libraries need the same -L/-l wiring executables
+                    # get, which the rule preamble alone does not supply. The
+                    # "build a shared object" flag itself lives in the
+                    # link_shared rule, so it must not be repeated here.
                     ldflags = list(target.ldflags)
-                    ldflags.insert(0, "-dynamiclib" if sys.platform == "darwin" else "-shared")
                     libs = []
                     for pkg_name in target.uses:
                         pkg = self.package_paths.get(pkg_name)

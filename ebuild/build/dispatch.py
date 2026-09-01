@@ -50,6 +50,23 @@ def _unknown_backend(backend: str, step: str) -> UnknownBackendError:
     )
 
 
+def ninja_command():
+    """Return the argv prefix that runs ninja on this machine.
+
+    Prefer a `ninja` executable on PATH -- that is what a developer who
+    followed any ordinary install guide has, and what CMake and Meson already
+    use. Fall back to the `ninja` PyPI wheel only when no binary is present.
+
+    ebuild used to invoke `sys.executable -m ninja` unconditionally, so a
+    machine with ninja correctly installed still failed with "No module named
+    ninja" on the first build of a new project.
+    """
+    import shutil
+
+    exe = shutil.which("ninja")
+    return [exe] if exe else [sys.executable, "-m", "ninja"]
+
+
 def detect_backend(source_dir: Path) -> str:
     """Auto-detect the build system from project files.
 
@@ -241,7 +258,7 @@ class BackendDispatcher:
             )
         elif backend == "ninja":
             _run_or_log(
-                [sys.executable, "-m", "ninja", "-C", str(self.build_dir), "-t", "clean"],
+                ninja_command() + ["-C", str(self.build_dir), "-t", "clean"],
                 dry_run,
                 check=False,
             )
