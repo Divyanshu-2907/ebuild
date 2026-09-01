@@ -50,6 +50,15 @@ class TestVersionKey:
         """A patch respin such as 1.2.11b supersedes 1.2.11."""
         assert version_sort_key("1.2.11") < version_sort_key("1.2.11b")
 
+    def test_successive_respins_order_among_themselves(self):
+        """1.2.11b supersedes 1.2.11a, and both supersede 1.2.11."""
+        assert version_sort_key("1.2.11a") < version_sort_key("1.2.11b")
+        assert version_sort_key("1.2.11") < version_sort_key("1.2.11a")
+
+    def test_respin_still_ranks_above_a_textual_component(self):
+        """A respin keeps its numeric rank, so it beats a non-numeric one."""
+        assert version_sort_key("1.2.beta") < version_sort_key("1.2.11b")
+
     def test_shorter_version_sorts_below_longer(self):
         assert version_sort_key("1.2") < version_sort_key("1.2.1")
 
